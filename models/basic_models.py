@@ -69,8 +69,8 @@ OUTPUT_DIR = Path(f"./output_run_{RUN_ID}")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=False)
 
 # Original I–V curve configuration
-ASSUMED_ORIGINAL_IV_POINTS   = 45
-ASSUMED_ORIGINAL_MAX_VOLTAGE = 1.2  # in Volts
+v1 = np.arange(0.0, 0.4 + 1e-8, 0.1)           # [0.0, 0.1, …, 0.4]
+v2 = np.arange(0.425, 1.4 + 1e-8, 0.025)      # [0.425, 0.450, …, 1.4]
 
 # Truncation & smoothing hyperparameters
 MIN_LEN_FOR_PROCESSING = 5         # Minimum points required after truncation
@@ -96,7 +96,7 @@ DROPOUT_RATE            = 0.30
 
 # Training hyperparameters
 NN_LEARNING_RATE = 1e-3
-NN_EPOCHS        = 200
+NN_EPOCHS        = 70
 BATCH_SIZE       = 128
 
 # Outlier detection
@@ -424,7 +424,7 @@ def build_nn_core(input_dim_params: int, seq_len: int, voltage_embed_dim: int = 
 
     # Voltage grid input path
     voltage_grid_in = Input(shape=(seq_len,), name="voltage_grid")
-    norm_voltage = Lambda(lambda v: v / ASSUMED_ORIGINAL_MAX_VOLTAGE)(voltage_grid_in)
+    norm_voltage = Lambda(lambda v: v / 1.4)(voltage_grid_in)
     pos_enc = Lambda(lambda v: sinusoidal_position_encoding(v, d_model=voltage_embed_dim))(norm_voltage)
     v_embed = TimeDistributed(Dense(voltage_embed_dim, activation='relu'))(pos_enc)
 
@@ -526,7 +526,8 @@ class TruncatedIVReconstructor:
             params_df = pd.read_csv(INPUT_FILE_PARAMS, header=None, names=COLNAMES)
             iv_data_np = np.loadtxt(INPUT_FILE_IV, delimiter=',', dtype=np.float32)
             logger.info(f"Loaded raw data: params {params_df.shape}, I–V {iv_data_np.shape}")
-            full_voltage_grid = np.linspace(0.0, ASSUMED_ORIGINAL_MAX_VOLTAGE, ASSUMED_ORIGINAL_IV_POINTS, dtype=np.float32)
+            full_voltage_grid = np.concatenate([v1, v2]).astype(np.float32)
+            assert full_voltage_grid.size == 45
 
             raw_currents, raw_voltages, valid_indices = [], [], []
             for i in range(iv_data_np.shape[0]):
