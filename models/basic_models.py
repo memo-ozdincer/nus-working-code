@@ -16,8 +16,6 @@ Key features:
 - Centralized hyperparameter configuration and logging.
 - A streamlined main execution path for training, evaluation, and visualization.
 
-Author: Your Name
-Date: YYYY-MM-DD
 """
 
 import os
