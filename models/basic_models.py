@@ -7,12 +7,12 @@ physics‐informed neural network. This version focuses exclusively on the NN
 approach, removing PCA and ensemble methods for clarity and simplicity.
 
 Key features:
-- Single‐responsibility utility functions for preprocessing (truncation, smoothing, padding, outlier removal).
-- Per‐curve I_sc‐based normalization.
+- Single‐responsibility utility functions for preprocessing (truncation, padding).
+- Uniform [-1, 1] scaling for all inputs and outputs for improved convergence.
 - A sophisticated physics‐informed loss function including:
   - Knee‐weighted Mean Squared Error (MSE).
-  - Penalties for monotonicity, curvature, J_sc, and V_oc.
-- Sinusoidal positional encoding for voltage embedding with a residual block architecture.
+  - Penalties for monotonicity, curvature, J_sc, and V_oc, adapted for [-1, 1] scale.
+- Fourier Feature encoding for voltage embedding with a TCN architecture.
 - Centralized hyperparameter configuration and logging.
 - A streamlined main execution path for training, evaluation, and visualization.
 
@@ -27,13 +27,10 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from scipy.signal import savgol_filter
-
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import RobustScaler, StandardScaler, FunctionTransformer
+from sklearn.preprocessing import RobustScaler, MinMaxScaler, FunctionTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import IsolationForest
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
 import tensorflow as tf
@@ -41,11 +38,19 @@ from tensorflow import keras
 from tensorflow.keras import layers
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
-    Dense, Dropout, BatchNormalization, Input, Add, Lambda, TimeDistributed, Concatenate
+    Dense, Dropout, BatchNormalization, Input, Add, Lambda, TimeDistributed, Concatenate,
+    Conv1D, SpatialDropout1D  # ### CHANGE 4: Added Conv1D and SpatialDropout1D
 )
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers.schedules import CosineDecay # ### CHANGE 5: Added CosineDecay
+from tensorflow.keras.callbacks import EarlyStopping
 
+import typing
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for g in gpus:
+        tf.config.experimental.set_memory_growth(g, True)
 # ───────────────────────────────────────────────────────────────────────────────
 #  Logging Configuration
 # ───────────────────────────────────────────────────────────────────────────────
@@ -72,36 +77,33 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=False)
 v1 = np.arange(0.0, 0.4 + 1e-8, 0.1)           # [0.0, 0.1, …, 0.4]
 v2 = np.arange(0.425, 1.4 + 1e-8, 0.025)      # [0.425, 0.450, …, 1.4]
 
-# Truncation & smoothing hyperparameters
+# Truncation hyperparameters
 MIN_LEN_FOR_PROCESSING = 5         # Minimum points required after truncation
-MIN_LEN_SAVGOL        = 5          # Minimum points to apply Savitzky–Golay
-SAVGOL_POLYORDER      = 2          # Polynomial order for SavGol
-SAVGOL_LOWER_WINDOW   = 3          # Minimum window length for SavGol
 
-# Physics‐informed loss weights
+# Tuned loss weights and window parameters
 LOSS_WEIGHTS = {
-    'mse': 1.0,
-    'monotonicity': 0.02,    # Reduced after knee‐weighting
-    'curvature': 0.02,       # Reduced after knee‐weighting
-    'jsc': 0.20,
-    'voc': 0.25              # Increased to force current→0 at V_oc
+    'mse': 0.7763944472,
+    'monotonicity': 0.0008268117,
+    'curvature': 0.0030637258,
+    'jsc': 0.1003401706,
+    'voc': 0.1632580476
 }
-KNEE_WEIGHT_FACTOR = 2.0   # Weight for last two valid points in MSE
+KNEE_WEIGHT_FACTOR = 2.1355485479
+KNEE_WINDOW_SIZE   = 4
+RANDOM_SEED = 42
 
-# Neural network architecture
-VOLTAGE_EMBED_DIM       = 16     # d_model for sinusoidal positional encoding
-DENSE_UNITS_PARAMS      = [256, 128, 128]  # Layer widths for param path
-DENSE_UNITS_MERGED      = [256, 128]       # Layer widths after concatenation
-DROPOUT_RATE            = 0.30
+# Neural network architecture (tuned hyperparameters)
+FOURIER_NUM_BANDS       = 16          # from best trial
+DENSE_UNITS_PARAMS      = [256, 128, 128]  # unchanged
+TCN_FILTERS             = [256, 64]       # tuned
+TCN_KERNEL_SIZE         = 5               # tuned
+DROPOUT_RATE            = 0.2801020847    # tuned
 
 # Training hyperparameters
-NN_LEARNING_RATE = 1e-3
-NN_EPOCHS        = 70
-BATCH_SIZE       = 128
-
-# Outlier detection
-ISOFOREST_CONTAMINATION = 0.05
-ISOFOREST_RANDOM_STATE  = 42
+NN_INITIAL_LEARNING_RATE = 0.0020778887  # peak_lr from best trial
+NN_FINAL_LEARNING_RATE   = 5.3622e-06    # final_lr for CosineDecay
+NN_EPOCHS                = 70
+BATCH_SIZE               = 128            # tuned
 
 # Column names for input parameters file
 COLNAMES = [
@@ -119,7 +121,7 @@ def truncate_iv_curve(
     curve_current_raw: np.ndarray,
     full_voltage_grid: np.ndarray,
     truncation_threshold_pct: float
-) -> (np.ndarray, np.ndarray):
+) -> tuple[typing.Optional[np.ndarray], typing.Optional[np.ndarray]]:
     """
     Truncate an I–V curve where current drops below truncation_threshold_pct * I_sc.
     Assumes no negative current values (currents ≥ 0).
@@ -147,64 +149,44 @@ def truncate_iv_curve(
     return voltage_trunc, current_trunc
 
 
-def apply_savgol(current_trunc: np.ndarray) -> np.ndarray:
+def normalize_and_scale_by_isc(curve_trunc: np.ndarray) -> tuple[float, np.ndarray]:
     """
-    Apply Savitzky–Golay smoothing to truncated current array if length ≥ MIN_LEN_SAVGOL.
-    Otherwise, return unchanged.
-    """
-    L = current_trunc.size
-    if L < MIN_LEN_SAVGOL + 2:
-        return current_trunc
-
-    wl = min(max(MIN_LEN_SAVGOL, ((L // 10) * 2 + 1)), L)
-    if wl % 2 == 0:
-        wl -= 1
-    wl = max(SAVGOL_LOWER_WINDOW, wl)
-    if wl > L:
-        wl = L if L % 2 == 1 else L - 1
-    polyorder = max(0, min(SAVGOL_POLYORDER, wl - 1))
-
-    if L > wl and wl >= 3:
-        return savgol_filter(current_trunc, window_length=wl, polyorder=polyorder)
-    return current_trunc
-
-
-def normalize_by_isc(curve_trunc: np.ndarray) -> (float, np.ndarray):
-    """
-    Normalize a truncated current array by its I_sc (first value).
-    Returns (isc_value, normalized_array).
+    Normalize a truncated current array by its I_sc (first value) to [0, 1],
+    then scale it to the [-1, 1] range.
+    Returns (isc_value, scaled_array).
     Assumes curve_trunc[0] > 0.
     """
     isc_val = float(curve_trunc[0])
     if isc_val <= 0:
-        # If I_sc is zero or negative, skip normalization
+        # If I_sc is zero or negative, return unscaled and unnormalized
         return 1.0, curve_trunc.copy().astype(np.float32)
     norm_curve = curve_trunc / isc_val
-    return isc_val, norm_curve.astype(np.float32)
+    scaled_curve = 2.0 * norm_curve - 1.0 # Scale from [0, 1] to [-1, 1]
+    return isc_val, scaled_curve.astype(np.float32)
 
 
 def pad_and_create_mask(
-    norm_curves: list,
+    scaled_curves: list,
     volt_curves: list
-) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Given a list of normalized current arrays and corresponding voltage arrays
+    Given a list of [-1, 1] scaled current arrays and corresponding voltage arrays
     (both truncated), pad each to the maximum length among them.
     Returns:
-      - y_padded: (N, max_len) float32, normalized currents, padded by last valid value.
+      - y_padded: (N, max_len) float32, scaled currents, padded by last valid value.
       - v_padded: (N, max_len) float32, voltages, padded by last valid voltage.
       - mask:     (N, max_len) float32, 1.0 for valid points, 0.0 for padded.
       - lengths:  (N,)       int, original lengths of each truncated curve.
     """
-    lengths = [c.size for c in norm_curves]
+    lengths = [c.size for c in scaled_curves]
     max_len = max(lengths) if lengths else 0
-    n_samples = len(norm_curves)
+    n_samples = len(scaled_curves)
 
     y_padded = np.zeros((n_samples, max_len), dtype=np.float32)
     v_padded = np.zeros((n_samples, max_len), dtype=np.float32)
     mask     = np.zeros((n_samples, max_len), dtype=np.float32)
 
-    for i, (c, v) in enumerate(zip(norm_curves, volt_curves)):
+    for i, (c, v) in enumerate(zip(scaled_curves, volt_curves)):
         L = c.size
         y_padded[i, :L] = c
         v_padded[i, :L] = v
@@ -216,151 +198,153 @@ def pad_and_create_mask(
     return y_padded, v_padded, mask, np.array(lengths, dtype=np.int32)
 
 
-def remove_outliers_via_isolation_forest(
-    scalar_features_df: pd.DataFrame,
-    contamination: float = ISOFOREST_CONTAMINATION
-) -> np.ndarray:
-    """
-    Detect outliers using IsolationForest on raw scalar features derived from the curves.
-    Returns a boolean mask of shape (N,) where True = inlier, False = outlier.
-    """
-    logger.info(f"Detecting outliers with IsolationForest (contamination={contamination})...")
-    iso = IsolationForest(
-        contamination=contamination,
-        random_state=ISOFOREST_RANDOM_STATE,
-        n_estimators=100,
-        n_jobs=-1
-    )
-    features = scalar_features_df[['Isc_raw', 'Vknee_raw', 'Imax_raw', 'Imin_raw', 'Imean_raw']].values
-    labels = iso.fit_predict(features)  # +1 for inliers, -1 for outliers
-    inlier_mask = labels == 1
-    n_outliers = np.sum(~inlier_mask)
-    pct_outliers = 100 * n_outliers / len(labels)
-    logger.info(f"  Removed {n_outliers} outliers ({pct_outliers:.1f}%).")
-    return inlier_mask
+### CHANGE 2: RANDOM FOURIER FEATURES ###
+B = tf.constant(np.logspace(0, 3, num=FOURIER_NUM_BANDS), dtype=tf.float32)
 
-
-def sinusoidal_position_encoding(V_norm: tf.Tensor, d_model: int = VOLTAGE_EMBED_DIM) -> tf.Tensor:
+def fourier_features(V_norm, B_matrix=B):
     """
-    Generate sinusoidal positional encoding for normalized voltage grid V_norm.
+    Generate random Fourier features for normalized voltage grid V_norm.
     V_norm shape: (batch_size, seq_len), values ∈ [0, 1].
-    Returns: (batch_size, seq_len, d_model) tensor.
+    Returns: (batch_size, seq_len, 2 * FOURIER_NUM_BANDS) tensor.
     """
-    V_exp = tf.expand_dims(V_norm, axis=-1)  # shape = (batch_size, seq_len, 1)
+    # V_norm: [batch, seq] -> V: [batch, seq, num_bands]
+    V = V_norm[..., None] * B_matrix[None, None, :]
+    # Result: [batch, seq, 2 * num_bands]
+    return tf.concat([tf.sin(2 * np.pi * V), tf.cos(2 * np.pi * V)], axis=-1)
 
-    position = tf.cast(V_exp, tf.float32)
-    div_term = tf.exp(
-        tf.range(0, d_model, 2, dtype=tf.float32) *
-        -(np.log(10000.0) / tf.cast(d_model, tf.float32))
-    )  # shape = (d_model/2,)
 
-    angle_rates = position * div_term[None, None, :]
-    sin_enc = tf.sin(angle_rates)
-    cos_enc = tf.cos(angle_rates)
-    pos_encoding = tf.concat([sin_enc, cos_enc], axis=-1)
-    return pos_encoding
+### CHANGE 3: MASKED LOSS WINDOW ###
+def masked_loss_window(mask: tf.Tensor, orig_len: tf.Tensor, window: int = KNEE_WINDOW_SIZE) -> tf.Tensor:
+    """
+    Creates a mask that is 1.0 only for points within +/- window of the MPP knee.
+    The MPP knee is assumed to be at the last valid point (orig_len - 1).
+    """
+    idx = tf.range(tf.shape(mask)[1])[None, :]  # Shape: [1, seq_len]
+    mpp_idx = tf.reshape(orig_len - 1, (-1, 1)) # Shape: [batch_size, 1]
+
+    # Create a boolean mask for the window around the MPP
+    window_mask = tf.logical_and(idx >= mpp_idx - window, idx <= mpp_idx + window)
+    return tf.cast(window_mask, tf.float32)
 
 
 def masked_mse_with_knee_weight(
     y_true: tf.Tensor, y_pred: tf.Tensor, mask: tf.Tensor, orig_len: tf.Tensor
 ) -> tf.Tensor:
     """
-    Compute MSE with additional weighting (KNEE_WEIGHT_FACTOR) on the last two valid points.
-    y_true, y_pred, mask shape: (batch_size, seq_len)
-    orig_len shape: (batch_size,) ⇒ lengths of each truncated curve
+    Compute MSE with additional weighting on points inside the knee window.
     """
     y_true, y_pred, mask = tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), tf.cast(mask, tf.float32)
-    orig_l = tf.cast(orig_len, tf.int32)
-
-    batch_size, seq_len = tf.shape(y_pred)[0], tf.shape(y_pred)[1]
     se = tf.square(y_true - y_pred)
 
-    idx = tf.range(seq_len)[None, :]
-    last_idx = tf.reshape(orig_l - 1, (batch_size, 1))
-    second_last_idx = last_idx - 1
+    # ### CHANGE 3: Use windowed mask for knee weighting ###
+    w = masked_loss_window(mask, orig_len, window=KNEE_WINDOW_SIZE)
+    # Apply base weight of 1.0 everywhere, and add (FACTOR-1.0) inside the window
+    knee_weights = 1.0 + (KNEE_WEIGHT_FACTOR - 1.0) * w
 
-    is_last = tf.equal(idx, last_idx)
-    is_second_last = tf.logical_and(tf.greater_equal(second_last_idx, 0), tf.equal(idx, second_last_idx))
-    knee_mask = tf.where(tf.logical_or(is_last, is_second_last), KNEE_WEIGHT_FACTOR, 1.0)
-    knee_mask = tf.cast(knee_mask, tf.float32)
-
-    weighted_se = se * mask * knee_mask
-    mse_per_sample = tf.reduce_sum(weighted_se, axis=-1) / (tf.reduce_sum(mask * knee_mask, axis=-1) + 1e-7)
+    weighted_se = se * mask * knee_weights
+    mse_per_sample = tf.reduce_sum(weighted_se, axis=-1) / (tf.reduce_sum(mask * knee_weights, axis=-1) + 1e-7)
     return tf.reduce_mean(mse_per_sample)
 
 
-def monotonicity_penalty_loss(y_pred: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
+def monotonicity_penalty_loss(y_pred: tf.Tensor, mask: tf.Tensor, orig_len: tf.Tensor) -> tf.Tensor:
     """
-    Penalize any instance where I_{i+1} > I_i (current increasing with voltage).
+    Penalize I_{i+1} > I_i, but only within the specified knee window.
     """
     y_pred, mask = tf.cast(y_pred, tf.float32), tf.cast(mask, tf.float32)
     diffs = y_pred[:, 1:] - y_pred[:, :-1]
+
+    # Base mask for valid differences
     diff_mask = mask[:, 1:] * mask[:, :-1]
-    violations = tf.nn.relu(diffs) * diff_mask
+
+    # ### CHANGE 3: Localize penalty to the knee window ###
+    window_w = masked_loss_window(mask, orig_len, window=KNEE_WINDOW_SIZE)
+    # Ensure the window mask applies to the difference pairs
+    window_mask_for_diffs = window_w[:, :-1] * window_w[:, 1:]
+
+    final_mask = diff_mask * window_mask_for_diffs
+
+    violations = tf.nn.relu(diffs) * final_mask
     sum_violation = tf.reduce_sum(tf.square(violations), axis=-1)
-    return tf.reduce_mean(sum_violation / (tf.reduce_sum(diff_mask, axis=-1) + 1e-7))
+    return tf.reduce_mean(sum_violation / (tf.reduce_sum(final_mask, axis=-1) + 1e-7))
 
 
-def curvature_penalty_loss(y_pred: tf.Tensor, mask: tf.Tensor) -> tf.Tensor:
+def curvature_penalty_loss(y_pred: tf.Tensor, mask: tf.Tensor, orig_len: tf.Tensor) -> tf.Tensor:
     """
-    Penalize large second derivatives in normalized current (encouraging smooth convex shape).
+    Penalize large second derivatives, but only within the specified knee window.
     """
     y_pred, mask = tf.cast(y_pred, tf.float32), tf.cast(mask, tf.float32)
     curvature = y_pred[:, 2:] - 2.0 * y_pred[:, 1:-1] + y_pred[:, :-2]
+
+    # Base mask for valid curvature points
     curv_mask = mask[:, 2:] * mask[:, 1:-1] * mask[:, :-2]
-    weighted_curv = tf.square(curvature) * curv_mask
-    return tf.reduce_mean(tf.reduce_sum(weighted_curv, axis=-1) / (tf.reduce_sum(curv_mask, axis=-1) + 1e-7))
+
+    # ### CHANGE 3: Localize penalty to the knee window ###
+    window_w = masked_loss_window(mask, orig_len, window=KNEE_WINDOW_SIZE)
+    # Ensure window mask applies to the 3-point stencil
+    window_mask_for_curv = window_w[:, :-2] * window_w[:, 1:-1] * window_w[:, 2:]
+
+    final_mask = curv_mask * window_mask_for_curv
+
+    weighted_curv = tf.square(curvature) * final_mask
+    return tf.reduce_mean(tf.reduce_sum(weighted_curv, axis=-1) / (tf.reduce_sum(final_mask, axis=-1) + 1e-7))
 
 
 def jsc_voc_penalty_loss(
     y_true: tf.Tensor, y_pred: tf.Tensor, mask: tf.Tensor, orig_len: tf.Tensor
-) -> (tf.Tensor, tf.Tensor):
+) -> tuple[tf.Tensor, tf.Tensor]:
     """
-    Compute two penalties: J_sc MSE at V=0 and V_oc MSE (current at last point should be 0).
+    Compute two penalties: J_sc MSE at V=0 and V_oc MSE (current at last point should be -1.0).
     """
     y_true, y_pred, mask = tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), tf.cast(mask, tf.float32)
     orig_l = tf.cast(orig_len, tf.int32)
 
-    # J_sc MSE at index 0
+    # J_sc MSE at index 0. Target is y_true[:, 0], which should be 1.0.
     jsc_mse = tf.reduce_mean(tf.square(y_true[:, 0] - y_pred[:, 0]) * mask[:, 0])
 
-    # V_oc penalty: current at the last valid index should be zero
+    # V_oc penalty: current at the last valid index should be -1.0 (scaled from 0).
     batch_size = tf.shape(y_pred)[0]
     indices = tf.range(batch_size, dtype=tf.int32)
     last_indices = tf.clip_by_value(orig_l - 1, 0, tf.shape(y_pred)[1] - 1)
     gather_idx = tf.stack([indices, last_indices], axis=1)
     last_pred = tf.gather_nd(y_pred, gather_idx)
 
+    # The target value for the last point is -1.0
+    voc_target = -1.0
     voc_mask = tf.cast(orig_l > 0, tf.float32)
-    voc_mse = tf.reduce_sum(tf.square(last_pred) * voc_mask) / (tf.reduce_sum(voc_mask) + 1e-7)
+    voc_mse = tf.reduce_sum(tf.square(last_pred - voc_target) * voc_mask) / (tf.reduce_sum(voc_mask) + 1e-7)
     return jsc_mse, voc_mse
 
 
-def combined_physics_loss(loss_weights: dict):
-    """
-    Factory function for a combined physics-informed loss.
-    """
-    def loss_fn(y_true_combined, y_pred):
-        y_true, mask, orig_l = y_true_combined['y_true'], y_true_combined['mask'], y_true_combined['orig_len']
-        mse_part = masked_mse_with_knee_weight(y_true, y_pred, mask, orig_l)
-        mono_part = monotonicity_penalty_loss(y_pred, mask)
-        curv_part = curvature_penalty_loss(y_pred, mask)
-        jsc_part, voc_part = jsc_voc_penalty_loss(y_true, y_pred, mask, orig_l)
+def get_all_loss_components(y_true_combined, y_pred):
+    """Helper to compute all loss components for logging."""
+    y_true, mask, orig_l = y_true_combined['y_true'], y_true_combined['mask'], y_true_combined['orig_len']
+    mse_part = masked_mse_with_knee_weight(y_true, y_pred, mask, orig_l)
+    # ### CHANGE 3: Pass orig_len to mono and curv losses ###
+    mono_part = monotonicity_penalty_loss(y_pred, mask, orig_l)
+    curv_part = curvature_penalty_loss(y_pred, mask, orig_l)
+    jsc_part, voc_part = jsc_voc_penalty_loss(y_true, y_pred, mask, orig_l)
+    return mse_part, mono_part, curv_part, jsc_part, voc_part
 
-        return (loss_weights['mse'] * mse_part +
-                loss_weights['monotonicity'] * mono_part +
-                loss_weights['curvature'] * curv_part +
-                loss_weights['jsc'] * jsc_part +
-                loss_weights['voc'] * voc_part)
+
+def combined_physics_loss(loss_weights: dict):
+    """Factory function for a combined physics-informed loss."""
+    def loss_fn(y_true_combined, y_pred):
+        mse, mono, curv, jsc, voc = get_all_loss_components(y_true_combined, y_pred)
+        return (loss_weights['mse'] * mse +
+                loss_weights['monotonicity'] * mono +
+                loss_weights['curvature'] * curv +
+                loss_weights['jsc'] * jsc +
+                loss_weights['voc'] * voc)
     return loss_fn
 
 # ───────────────────────────────────────────────────────────────────────────────
 #  Preprocessing: Input Parameters & Scalar Features
 # ───────────────────────────────────────────────────────────────────────────────
 
-def preprocess_input_parameters(params_df: pd.DataFrame) -> np.ndarray:
+def preprocess_input_parameters(params_df: pd.DataFrame) -> tuple[np.ndarray, ColumnTransformer]:
     """
-    Transform device/material parameters with group‐wise pipelines.
+    Transform device/material parameters with group‐wise pipelines, scaling to [-1, 1].
+    Returns the processed data and the fitted transformer.
     """
     logger.info("Preprocessing input parameters (device, material, etc.)...")
     const_tol = 1e-10
@@ -380,24 +364,31 @@ def preprocess_input_parameters(params_df: pd.DataFrame) -> np.ndarray:
     for group, cols in param_defs.items():
         actual_cols = [c for c in cols if c in params_df.columns]
         if not actual_cols: continue
-        steps = [('log1p', FunctionTransformer(func=np.log1p, validate=False))] if group == 'material' else []
-        steps.append(('scaler', RobustScaler()))
+        steps = []
+        if group == 'material':
+             steps.append(('log1p', FunctionTransformer(func=np.log1p, validate=False)))
+        steps.extend([
+            ('robust', RobustScaler()),
+            ('minmax', MinMaxScaler(feature_range=(-1, 1)))
+        ])
         transformers.append((group, Pipeline(steps), actual_cols))
 
     column_transformer = ColumnTransformer(transformers, remainder='passthrough')
     X_processed = column_transformer.fit_transform(params_df)
     logger.info(f"  Processed param features shape: {X_processed.shape}")
-    return X_processed.astype(np.float32)
+    return X_processed.astype(np.float32), column_transformer
 
 
 def preprocess_scalar_features(scalar_features_df: pd.DataFrame, fit: bool = True,
-                               scaler: StandardScaler = None) -> (np.ndarray, StandardScaler):
+                               scaler: Pipeline = None) -> tuple[np.ndarray, Pipeline]:
     """
-    Standardize scalar features derived from the I-V curves.
+    Scale scalar features derived from the I-V curves to [-1, 1].
     """
     logger.info(f"Preprocessing scalar features: {list(scalar_features_df.columns)}")
     if fit:
-        scaler = StandardScaler()
+        scaler = Pipeline([
+            ('scaler', MinMaxScaler(feature_range=(-1, 1)))
+        ])
         X_scaled = scaler.fit_transform(scalar_features_df.values)
     else:
         if scaler is None: raise RuntimeError("Scaler not provided for transform.")
@@ -409,9 +400,10 @@ def preprocess_scalar_features(scalar_features_df: pd.DataFrame, fit: bool = Tru
 #  Neural Network Definition
 # ───────────────────────────────────────────────────────────────────────────────
 
-def build_nn_core(input_dim_params: int, seq_len: int, voltage_embed_dim: int = VOLTAGE_EMBED_DIM) -> Model:
+def build_nn_core(input_dim_params: int, seq_len: int) -> Model:
     """
     Build the core Keras Model for the physics‐informed NN.
+    This version uses Fourier Features and a TCN head.
     """
     # Parameter input path
     x_params_in = Input(shape=(input_dim_params,), name="X_params")
@@ -424,28 +416,20 @@ def build_nn_core(input_dim_params: int, seq_len: int, voltage_embed_dim: int = 
 
     # Voltage grid input path
     voltage_grid_in = Input(shape=(seq_len,), name="voltage_grid")
-    norm_voltage = Lambda(lambda v: v / 1.4)(voltage_grid_in)
-    pos_enc = Lambda(lambda v: sinusoidal_position_encoding(v, d_model=voltage_embed_dim))(norm_voltage)
-    v_embed = TimeDistributed(Dense(voltage_embed_dim, activation='relu'))(pos_enc)
+    # ### CHANGE 2: Use Fourier Features for voltage embedding ###
+    norm_voltage = Lambda(lambda v: v / 1.4)(voltage_grid_in) # Normalize voltage to [0, 1]
+    v_embed = Lambda(fourier_features)(norm_voltage)
 
     # Merge paths
     param_tiled = Lambda(lambda t: tf.tile(tf.expand_dims(t, 1), [1, seq_len, 1]))(param_path)
-    merged = Concatenate(axis=-1)([param_tiled, v_embed])
+    x = Concatenate(axis=-1)([param_tiled, v_embed])
 
-    # Residual Block
-    skip = TimeDistributed(Dense(DENSE_UNITS_MERGED[0], activation=None))(merged)
-    res = TimeDistributed(Dense(DENSE_UNITS_MERGED[0], activation='relu'))(merged)
-    res = BatchNormalization()(res)
-    x2 = Add()([skip, res])
-    x2 = Dropout(DROPOUT_RATE)(x2)
+    # ### CHANGE 4: Replace TimeDistributed MLP with a TCN stack ###
+    x = Conv1D(TCN_FILTERS[1], kernel_size=TCN_KERNEL_SIZE, padding='same', activation='relu')(x)
+    x = SpatialDropout1D(DROPOUT_RATE)(x)
 
-    # Final dense layers
-    x2 = TimeDistributed(Dense(DENSE_UNITS_MERGED[1], activation='relu'))(x2)
-    x2 = BatchNormalization()(x2)
-    x2 = Dropout(DROPOUT_RATE)(x2)
-
-    # Output layer
-    iv_output = TimeDistributed(Dense(1, activation='sigmoid'))(x2)
+    # ### CHANGE 1 & 4: Final projection with linear activation ###
+    iv_output = Conv1D(1, kernel_size=1, padding='same', activation=None)(x)
     iv_output_flat = Lambda(lambda t: tf.squeeze(t, axis=-1))(iv_output)
 
     return Model(inputs=[x_params_in, voltage_grid_in], outputs=iv_output_flat, name="NN_Core")
@@ -453,18 +437,31 @@ def build_nn_core(input_dim_params: int, seq_len: int, voltage_embed_dim: int = 
 
 class PhysicsNNModel(keras.Model):
     """
-    Custom Keras Model wrapper to integrate the core NN with the physics-informed loss.
+    Custom Keras Model wrapper to integrate the core NN with the physics-informed loss
+    and detailed metric tracking.
     """
     def __init__(self, nn_core: Model, loss_weights: dict, **kwargs):
         super().__init__(**kwargs)
         self.nn_core = nn_core
+        self.loss_weights = loss_weights
         self.custom_loss_fn = combined_physics_loss(loss_weights)
+
         self.loss_tracker = keras.metrics.Mean(name="loss")
-        self.mae_metric = keras.metrics.MeanAbsoluteError(name="mae")
+        self.mse_loss_tracker = keras.metrics.Mean(name="mse_loss")
+        self.mono_loss_tracker = keras.metrics.Mean(name="mono_loss")
+        self.curv_loss_tracker = keras.metrics.Mean(name="curv_loss")
+        self.jsc_loss_tracker = keras.metrics.Mean(name="jsc_loss")
+        self.voc_loss_tracker = keras.metrics.Mean(name="voc_loss")
+        self.mae_metric = keras.metrics.MeanAbsoluteError(name="mae_scaled") # MAE on scaled data
 
     @property
     def metrics(self):
-        return [self.loss_tracker, self.mae_metric]
+        # Return all trackers to be displayed by Keras
+        return [
+            self.loss_tracker, self.mse_loss_tracker, self.mono_loss_tracker,
+            self.curv_loss_tracker, self.jsc_loss_tracker, self.voc_loss_tracker,
+            self.mae_metric
+        ]
 
     def call(self, inputs, training=False):
         return self.nn_core(inputs, training=training)
@@ -473,20 +470,64 @@ class PhysicsNNModel(keras.Model):
         inputs, y_true_combined = data
         with tf.GradientTape() as tape:
             y_pred = self.nn_core(inputs, training=True)
-            loss = self.custom_loss_fn(y_true_combined, y_pred)
-        grads = tape.gradient(loss, self.nn_core.trainable_variables)
+            mse, mono, curv, jsc, voc = get_all_loss_components(y_true_combined, y_pred)
+            total_loss = (self.loss_weights['mse'] * mse +
+                          self.loss_weights['monotonicity'] * mono +
+                          self.loss_weights['curvature'] * curv +
+                          self.loss_weights['jsc'] * jsc +
+                          self.loss_weights['voc'] * voc)
+
+        grads = tape.gradient(total_loss, self.nn_core.trainable_variables)
         self.optimizer.apply_gradients(zip(grads, self.nn_core.trainable_variables))
-        self.loss_tracker.update_state(loss)
-        self.mae_metric.update_state(y_true_combined['y_true'], y_pred)
-        return {"loss": self.loss_tracker.result(), "mae": self.mae_metric.result()}
+        y_true = y_true_combined['y_true']
+        mask   = y_true_combined['mask']
+        y_pred = y_pred
+
+        bool_mask = tf.cast(mask, tf.bool)
+        y_true_masked = tf.boolean_mask(y_true, bool_mask)
+        y_pred_masked = tf.boolean_mask(y_pred, bool_mask)
+
+        # Update all metric trackers
+        self.loss_tracker.update_state(total_loss)
+        self.mse_loss_tracker.update_state(mse)
+        self.mono_loss_tracker.update_state(mono)
+        self.curv_loss_tracker.update_state(curv)
+        self.jsc_loss_tracker.update_state(jsc)
+        self.voc_loss_tracker.update_state(voc)
+        self.mae_metric.update_state(y_true_masked, y_pred_masked)
+
+        return {m.name: m.result() for m in self.metrics}
 
     def test_step(self, data):
         inputs, y_true_combined = data
         y_pred = self.nn_core(inputs, training=False)
-        loss = self.custom_loss_fn(y_true_combined, y_pred)
-        self.loss_tracker.update_state(loss)
-        self.mae_metric.update_state(y_true_combined['y_true'], y_pred)
-        return {"loss": self.loss_tracker.result(), "mae": self.mae_metric.result()}
+
+        mse, mono, curv, jsc, voc = get_all_loss_components(y_true_combined, y_pred)
+        total_loss = (self.loss_weights['mse'] * mse +
+                      self.loss_weights['monotonicity'] * mono +
+                      self.loss_weights['curvature'] * curv +
+                      self.loss_weights['jsc'] * jsc +
+                      self.loss_weights['voc'] * voc)
+
+        # Update all metric trackers
+        self.loss_tracker.update_state(total_loss)
+        self.mse_loss_tracker.update_state(mse)
+        self.mono_loss_tracker.update_state(mono)
+        self.curv_loss_tracker.update_state(curv)
+        self.jsc_loss_tracker.update_state(jsc)
+        self.voc_loss_tracker.update_state(voc)
+        y_true = y_true_combined['y_true']
+        y_pred = y_pred
+        mask   = y_true_combined['mask']
+
+        # select only valid positions
+        bool_mask    = tf.cast(mask, tf.bool)
+        y_true_valid = tf.boolean_mask(y_true, bool_mask)
+        y_pred_valid = tf.boolean_mask(y_pred, bool_mask)
+
+        self.mae_metric.update_state(y_true_valid, y_pred_valid)
+
+        return {m.name: m.result() for m in self.metrics}
 
 # ───────────────────────────────────────────────────────────────────────────────
 #  Full Reconstructor Class
@@ -499,18 +540,10 @@ class TruncatedIVReconstructor:
     def __init__(self, use_gpu_if_available: bool = True):
         available_gpus = tf.config.list_physical_devices('GPU')
         self.use_gpu = bool(available_gpus) and use_gpu_if_available
-        if self.use_gpu:
-            logger.info("TensorFlow GPU detected. Will use GPU acceleration.")
-            try:
-                for gpu in available_gpus: tf.config.experimental.set_memory_growth(gpu, True)
-            except RuntimeError as e:
-                logger.warning(f"Error configuring GPU memory growth: {e}")
-        else:
-            logger.info("No GPU detected or GPU usage disabled. Using CPU only.")
 
-        self.X_clean = self.y_clean_norm_padded = self.padded_voltages = None
+        self.X_clean = self.y_clean_scaled_padded = self.padded_voltages = None
         self.masks = self.per_curve_isc = self.orig_lengths = None
-        self.scalar_scaler = None
+        self.param_transformer = self.scalar_scaler = None
         self.nn_model = self.training_history = None
 
     def load_and_prepare_data(self, truncation_threshold_pct: float = 0.0) -> bool:
@@ -534,14 +567,16 @@ class TruncatedIVReconstructor:
                 v_trunc, c_trunc = truncate_iv_curve(iv_data_np[i], full_voltage_grid, truncation_threshold_pct)
                 if v_trunc is None: continue
                 raw_voltages.append(v_trunc)
-                raw_currents.append(apply_savgol(c_trunc))
+                raw_currents.append(c_trunc)
                 valid_indices.append(i)
 
             if not raw_currents:
                 logger.error("No valid curves after truncation. Aborting."); return False
 
-            per_curve_isc, norm_curves = zip(*[normalize_by_isc(c) for c in raw_currents])
-            y_padded, v_padded, mask_matrix, lengths = pad_and_create_mask(list(norm_curves), raw_voltages)
+            per_curve_isc, scaled_curves = zip(*[normalize_and_scale_by_isc(c) for c in raw_currents])
+            y_padded, v_padded, mask_matrix, lengths = pad_and_create_mask(list(scaled_curves), raw_voltages)
+
+            params_df_valid = params_df.iloc[valid_indices].reset_index(drop=True)
 
             scalar_df = pd.DataFrame({
                 'Isc_raw': [c[0] for c in raw_currents],
@@ -550,20 +585,18 @@ class TruncatedIVReconstructor:
                 'Imin_raw': [np.min(c) for c in raw_currents],
                 'Imean_raw': [np.mean(c) for c in raw_currents]
             })
-            inlier_mask = remove_outliers_via_isolation_forest(scalar_df)
 
-            params_df_valid = params_df.iloc[valid_indices].reset_index(drop=True)
-            X_params = preprocess_input_parameters(params_df_valid[inlier_mask])
-            X_scalar, self.scalar_scaler = preprocess_scalar_features(scalar_df[inlier_mask], fit=True)
+            X_params, self.param_transformer = preprocess_input_parameters(params_df_valid)
+            X_scalar, self.scalar_scaler = preprocess_scalar_features(scalar_df, fit=True)
             self.X_clean = np.concatenate([X_params, X_scalar], axis=1)
 
-            self.y_clean_norm_padded = y_padded[inlier_mask]
-            self.padded_voltages = v_padded[inlier_mask]
-            self.masks = mask_matrix[inlier_mask]
-            self.per_curve_isc = np.array(per_curve_isc, dtype=np.float32)[inlier_mask]
-            self.orig_lengths = lengths[inlier_mask]
+            self.y_clean_scaled_padded = y_padded
+            self.padded_voltages = v_padded
+            self.masks = mask_matrix
+            self.per_curve_isc = np.array(per_curve_isc, dtype=np.float32)
+            self.orig_lengths = lengths
 
-            logger.info(f"Final cleaned data shapes: X={self.X_clean.shape}, y={self.y_clean_norm_padded.shape}")
+            logger.info(f"Final cleaned data shapes: X={self.X_clean.shape}, y={self.y_clean_scaled_padded.shape}")
             return True
         except Exception as e:
             logger.exception(f"Error during data loading/preparation: {e}")
@@ -574,41 +607,57 @@ class TruncatedIVReconstructor:
         Fit the physics‐informed neural network.
         """
         logger.info("=== Fitting Physics‐Informed Neural Network ===")
-        input_dim_params, seq_len = X_train.shape[1], self.y_clean_norm_padded.shape[1]
+        input_dim_params, seq_len = X_train.shape[1], self.y_clean_scaled_padded.shape[1]
         if seq_len == 0: raise RuntimeError("NN output dimension is zero. Aborting training.")
 
-        nn_core = build_nn_core(input_dim_params, seq_len, voltage_embed_dim=VOLTAGE_EMBED_DIM)
+        nn_core = build_nn_core(input_dim_params, seq_len)
         self.nn_model = PhysicsNNModel(nn_core, LOSS_WEIGHTS)
-        self.nn_model.compile(optimizer=Adam(learning_rate=NN_LEARNING_RATE))
+
+        # ### CHANGE 5: Implement CosineDecay learning rate schedule ###
+        steps_per_epoch = X_train.shape[0] // BATCH_SIZE
+        total_steps     = steps_per_epoch * NN_EPOCHS
+        cosine_lr_schedule = CosineDecay(
+            initial_learning_rate=NN_INITIAL_LEARNING_RATE,  # 0.0020778887
+            decay_steps=total_steps,
+            alpha=NN_FINAL_LEARNING_RATE / NN_INITIAL_LEARNING_RATE  # 5.3622e-06 / 0.0020778887
+        )
+        optimizer = Adam(learning_rate=cosine_lr_schedule)
+
+        self.nn_model.compile(optimizer=optimizer)
 
         train_ds = tf.data.Dataset.from_tensor_slices((
             {"X_params": X_train, "voltage_grid": V_train},
             {"y_true": y_train, "mask": M_train, "orig_len": L_train}
-        )).shuffle(10000).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+        )).shuffle(10000, seed=RANDOM_SEED).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
         val_ds = tf.data.Dataset.from_tensor_slices((
             {"X_params": X_val, "voltage_grid": V_val},
             {"y_true": y_val, "mask": M_val, "orig_len": L_val}
         )).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
+        # ### CHANGE 5: Removed ReduceLROnPlateau ###
         callbacks = [
-            EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True, verbose=1),
-            ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=15, min_lr=1e-7, verbose=1)
+            EarlyStopping(monitor='val_loss', patience=25, restore_best_weights=True, verbose=1),
         ]
         self.training_history = self.nn_model.fit(train_ds, epochs=NN_EPOCHS, validation_data=val_ds, callbacks=callbacks, verbose=1)
         logger.info("Physics‐informed NN training completed.")
 
     def predict(self, X: np.ndarray, V_padded: np.ndarray, per_curve_isc: np.ndarray, orig_lengths: np.ndarray) -> list:
         """
-        Predict truncated physical I–V curves (un‐normalized) for input X.
+        Predict truncated physical I–V curves (un‐scaled) for input X.
         """
         if self.nn_model is None: raise RuntimeError("NN model not fitted.")
         inputs = {"X_params": X, "voltage_grid": V_padded}
-        y_pred_norm_padded = self.nn_model.predict(inputs, batch_size=512, verbose=0)
+        y_pred_scaled_padded = self.nn_model.predict(inputs, batch_size=512, verbose=0)
 
         y_pred_list = []
         for i in range(X.shape[0]):
-            predicted_curve = y_pred_norm_padded[i] * per_curve_isc[i]
+            # Reverse the scaling: from [-1, 1] back to physical units.
+            # This logic is still correct even with a linear output layer,
+            # as the model is trained to predict values in the [-1, 1] space.
+            y_scaled = y_pred_scaled_padded[i]
+            y_norm = (y_scaled + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+            predicted_curve = y_norm * per_curve_isc[i] # [0, 1] -> physical
             y_pred_list.append(predicted_curve[:orig_lengths[i]].astype(np.float32))
         return y_pred_list
 
@@ -649,9 +698,10 @@ class TruncatedIVReconstructor:
         if N == 0: logger.warning("No samples to plot."); return
 
         indices = np.random.choice(N, size=min(n_samples, N), replace=False)
-        nrows, ncols = (n_samples + 1) // 2, 2
+        nrows, ncols = (n_samples + 3) // 4 * 2, 2
         fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 4), squeeze=False)
         axes = axes.flatten()
+
 
         for i_plot, idx in enumerate(indices):
             ax = axes[i_plot]
@@ -661,7 +711,7 @@ class TruncatedIVReconstructor:
 
             ax.plot(true_v, true_i, 'b-', lw=2, label='Actual')
             ax.plot(true_v, pred_i, 'r--', lw=2, label='Predicted')
-            ax.set_title(f"Sample {idx} (R²={r2_val:.3f})")
+            ax.set_title(f"Sample {idx} (R²={r2_val:.4f})")
             ax.set_xlabel("Voltage (V)"), ax.set_ylabel("Current Density (mA/cm²)"), ax.legend(), ax.grid(True, alpha=0.3)
 
         for j in range(len(indices), len(axes)): fig.delaxes(axes[j])
@@ -675,11 +725,17 @@ class TruncatedIVReconstructor:
 #  Main Execution
 # ───────────────────────────────────────────────────────────────────────────────
 
-def run_experiment(trunc_thresh_pct: float = 0.1, use_gpu: bool = True):
+def run_experiment(trunc_thresh_pct: float = 0.01, use_gpu: bool = True):
     """
     Executes a full experiment run: data loading, training, evaluation, and plotting.
     """
     logger.info(f"=== STARTING EXPERIMENT: Truncation={trunc_thresh_pct}, GPU={use_gpu} ===")
+
+    np.random.seed(RANDOM_SEED)
+    tf.random.set_seed(RANDOM_SEED)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    os.environ['PYTHONHASHSEED'] = str(RANDOM_SEED)
+
     recon = TruncatedIVReconstructor(use_gpu_if_available=use_gpu)
     if not recon.load_and_prepare_data(truncation_threshold_pct=trunc_thresh_pct):
         logger.error("Data preparation failed. Aborting experiment.")
@@ -687,15 +743,15 @@ def run_experiment(trunc_thresh_pct: float = 0.1, use_gpu: bool = True):
 
     # --- Data Splitting ---
     all_idx = np.arange(recon.X_clean.shape[0])
-    train_val_idx, test_idx = train_test_split(all_idx, test_size=0.2, random_state=42)
-    train_idx, val_idx = train_test_split(train_val_idx, test_size=0.15, random_state=42) # 0.15 * 0.8 = 12% of total
+    train_val_idx, test_idx = train_test_split(all_idx, test_size=0.2, random_state=RANDOM_SEED)
+    train_idx, val_idx = train_test_split(train_val_idx, test_size=0.15, random_state=RANDOM_SEED) # 0.15 * 0.8 = 12% of total
 
     # --- Training Data ---
-    X_train, y_train, V_train, M_train, L_train = (recon.X_clean[train_idx], recon.y_clean_norm_padded[train_idx],
+    X_train, y_train, V_train, M_train, L_train = (recon.X_clean[train_idx], recon.y_clean_scaled_padded[train_idx],
         recon.padded_voltages[train_idx], recon.masks[train_idx], recon.orig_lengths[train_idx])
 
     # --- Validation Data ---
-    X_val, y_val, V_val, M_val, L_val = (recon.X_clean[val_idx], recon.y_clean_norm_padded[val_idx],
+    X_val, y_val, V_val, M_val, L_val = (recon.X_clean[val_idx], recon.y_clean_scaled_padded[val_idx],
         recon.padded_voltages[val_idx], recon.masks[val_idx], recon.orig_lengths[val_idx])
 
     # --- NN Training ---
@@ -703,12 +759,20 @@ def run_experiment(trunc_thresh_pct: float = 0.1, use_gpu: bool = True):
 
     # --- Plot Training History ---
     if recon.training_history:
-        hist = recon.training_history.history
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(hist['loss'], label='Train Loss')
-        ax.plot(hist['val_loss'], label='Val Loss', linestyle='--')
-        ax.set_xlabel("Epoch"), ax.set_ylabel("Loss"), ax.set_title("Training & Validation Loss")
-        ax.legend(), ax.grid(True, alpha=0.3)
+        hist_df = pd.DataFrame(recon.training_history.history)
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+        ax1.plot(hist_df.index, hist_df['loss'], label='Train Total Loss')
+        ax1.plot(hist_df.index, hist_df['val_loss'], label='Val Total Loss', linestyle='--')
+        ax1.set_ylabel("Total Loss"), ax1.set_title("Training & Validation Loss"), ax1.legend(), ax1.grid(True, alpha=0.3)
+        ax1.set_yscale('log')
+
+        loss_cols = [c for c in hist_df.columns if c.endswith('_loss') and c not in ('loss','val_loss')]
+        for col in loss_cols:
+            ax2.plot(hist_df.index, hist_df[col], label=col.replace('_loss', ''))
+        ax2.set_xlabel("Epoch"), ax2.set_ylabel("Loss Component Value"), ax2.set_title("Training Loss Components")
+        ax2.legend(), ax2.grid(True, alpha=0.3), ax2.set_yscale('log')
+
+        plt.tight_layout()
         plt.savefig(OUTPUT_DIR / "training_history.png", dpi=300)
         plt.close(fig)
 
@@ -718,7 +782,10 @@ def run_experiment(trunc_thresh_pct: float = 0.1, use_gpu: bool = True):
         voltages, currents = [], []
         for i, master_idx in enumerate(indices):
             L = lengths[i]
-            currents.append(recon.y_clean_norm_padded[master_idx][:L] * isc_vals[i])
+            # De-scale the true curves from [-1, 1] back to physical units for evaluation
+            y_scaled = recon.y_clean_scaled_padded[master_idx][:L]
+            y_norm = (y_scaled + 1.0) / 2.0
+            currents.append(y_norm * isc_vals[i])
             voltages.append(recon.padded_voltages[master_idx][:L])
         return currents, voltages
 
@@ -738,7 +805,6 @@ def run_experiment(trunc_thresh_pct: float = 0.1, use_gpu: bool = True):
 
 if __name__ == "__main__":
     # Ensure input files exist or point to the correct location before running.
-    # This example call runs the full pipeline with a 10% truncation threshold.
     if not Path(INPUT_FILE_PARAMS).exists() or not Path(INPUT_FILE_IV).exists():
         logger.error("="*80)
         logger.error("Input data files not found!")
@@ -746,4 +812,6 @@ if __name__ == "__main__":
         logger.error(f"or update the INPUT_FILE_PARAMS and INPUT_FILE_IV constants in the script.")
         logger.error("="*80)
     else:
-        run_experiment(trunc_thresh_pct=0.10, use_gpu=True)
+        # Run with new defaults: 1% truncation threshold
+        run_experiment(trunc_thresh_pct=0.01, use_gpu=True)
+
