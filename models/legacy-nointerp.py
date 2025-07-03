@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-refactored_iv_reconstruction.py
+This is the final code before the method was switched to interpolation.
+Hyperparameter optimization was performed using the `optuna` library. The HPO code is not in the repo.
 
-A lean, focused implementation for Perovskite I–V curve reconstruction using a
+Note from early June: A lean, focused implementation for Perovskite I–V curve reconstruction using a
 physics‐informed neural network. This version focuses exclusively on the NN
 approach, removing PCA and ensemble methods for clarity and simplicity.
 
@@ -82,28 +83,28 @@ MIN_LEN_FOR_PROCESSING = 5         # Minimum points required after truncation
 
 # Tuned loss weights and window parameters
 LOSS_WEIGHTS = {
-    'mse': 0.7763944472,
-    'monotonicity': 0.0008268117,
-    'curvature': 0.0030637258,
-    'jsc': 0.1003401706,
-    'voc': 0.1632580476
+    'mse': 0.1803342607307616,         # updated
+    'monotonicity': 0.0008268117,      # keep
+    'curvature':    0.0030637258,      # keep
+    'jsc': 0.041028679818554695,       # updated
+    'voc': 0.1632580476                # keep
 }
-KNEE_WEIGHT_FACTOR = 2.1355485479
-KNEE_WINDOW_SIZE   = 4
+KNEE_WEIGHT_FACTOR = 2.1355485479     # keep
+KNEE_WINDOW_SIZE   = 4                # keep
 RANDOM_SEED = 42
 
 # Neural network architecture (tuned hyperparameters)
-FOURIER_NUM_BANDS       = 16          # from best trial
+FOURIER_NUM_BANDS       = 8           # was 16
 DENSE_UNITS_PARAMS      = [256, 128, 128]  # unchanged
-TCN_FILTERS             = [256, 64]       # tuned
-TCN_KERNEL_SIZE         = 5               # tuned
-DROPOUT_RATE            = 0.2801020847    # tuned
+TCN_FILTERS             = [256, 32]   # second layer down from 64 → 32
+TCN_KERNEL_SIZE         = 7           # was 5
+DROPOUT_RATE            = 0.17623268240751816  # was 0.2801
 
 # Training hyperparameters
-NN_INITIAL_LEARNING_RATE = 0.0020778887  # peak_lr from best trial
-NN_FINAL_LEARNING_RATE   = 5.3622e-06    # final_lr for CosineDecay
-NN_EPOCHS                = 70
-BATCH_SIZE               = 128            # tuned
+NN_INITIAL_LEARNING_RATE = 0.004277022251867502  # was 0.0020778887
+NN_FINAL_LEARNING_RATE   = 5.3622e-06            # unchanged
+NN_EPOCHS                = 70                    # unchanged
+BATCH_SIZE               = 64                    # was 128
 
 # Column names for input parameters file
 COLNAMES = [
@@ -725,7 +726,7 @@ class TruncatedIVReconstructor:
 #  Main Execution
 # ───────────────────────────────────────────────────────────────────────────────
 
-def run_experiment(trunc_thresh_pct: float = 0.01, use_gpu: bool = True):
+def run_experiment(trunc_thresh_pct: float = 0.09991097180491529, use_gpu: bool = True):
     """
     Executes a full experiment run: data loading, training, evaluation, and plotting.
     """
