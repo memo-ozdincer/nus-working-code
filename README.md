@@ -67,23 +67,16 @@ This project introduces a **Physics-Informed Neural Network**[^1][^6][^7] that r
 
 ---
 
-## Installation
+## Usage:
 
-```bash
-git clone https://github.com/yourusername/perovskite-pinn-iv.git
-cd perovskite-pinn-iv
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-*Tested on Ubuntu 20.04 / Python 3.8+ / PyTorch 1.9+ / TensorFlow 2.11*
+*(Everything under /models works OOTB with Google Colab). Matlab separate*
 
 ---
 
 ## Usage & Quickstart
 
-1. **Place Data:** Copy `LHS_parameters_m.txt` and `iV_m.txt` into `data/`.
+1. **Place Data:** 100k Data provided under data/ in CSV, .txt files. Parameters are LHS_params... iV curve w/ 45 points is iV_mtxt. For more info about the data, such as voltage sweep, refer to `other/interpolation_principles.mlx`
+
 2. **Run Experiment:**
 
    ```bash
@@ -137,7 +130,7 @@ Use the built-in `plot_results` method to generate:
 * **Training History Plot:** Log-scale loss curves for train/validation splits.
 
 Example:
-![Sample Predictions](output_run_20250706_123456/predictions_sample_test.png)
+![Sample Predictions](other/batch.png)
 
 ---
 
@@ -152,26 +145,11 @@ Example:
 ## Development & Testing
 
 * **Linting & Formatting:** Uses `flake8` and `black`—run `flake8 .` and `black .`.
-* **Unit Tests:** Add tests under `tests/` to validate preprocessing and model outputs.
-* **Continuous Integration:** GitHub Actions template included for automated testing on PRs.
-
+* **Unit Tests:** Add tests under `tests/` to validate preprocessing and model outputs. (Will upload soon)
 ---
 
-## Citation & Acknowledgements
 
-If you use this code, please cite our work:
-
-```bibtex
-@article{ozdincer2025pinn,
-  title={Physics-Informed TACN for Fast Perovskite J–V Modeling},
-  author={Ozdincer, Mehmet and Birgersson, Erik},
-  journal={Applied Energy},
-  year={2025},
-  note={preprint at https://github.com/yourusername/perovskite-pinn-iv}
-}
-```
-
-Special thanks to Prof. Erik Birgersson (NUS) for guidance and the Vector Institute for inspiring this research.
+Special thanks to Prof. Erik Birgersson (NUS) for his guidance, supervision and motivating this research.
 
 ---
 
