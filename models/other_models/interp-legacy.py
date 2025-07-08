@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 This is the working implementation, after implementing interpolation.
-It outperforms every other model, and now has logic for some better evaluation.
+Now its legacy, the new one is ported to lightning
 Approximate numbers:
 MAE: 4, RMSE: 10, R²: 0.996, R^2 per‐curve: ~0.991
 
@@ -92,7 +92,6 @@ LOSS_WEIGHTS = {
 }
 RANDOM_SEED = 42
 
-# --- ⭐️ HYBRID MODEL ARCHITECTURE & EMBEDDINGS ⭐️ ---
 EMBEDDING_TYPE = 'fourier_clipped'  # Options: 'fourier', 'fourier_clipped', 'gaussian'
 
 # Architecture
@@ -261,7 +260,7 @@ def preprocess_scalar_features(df: pd.DataFrame, fit: bool = True, scaler: Pipel
     return scaler.fit_transform(df.values).astype(np.float32) if fit else scaler.transform(df.values).astype(np.float32), scaler
 
 # ───────────────────────────────────────────────────────────────────────────────
-#  ⭐️ HYBRID MODEL DEFINITION: Attention-Augmented TCN ⭐️
+#  HYBRID MODEL DEFINITION: Attention-Augmented TCN 
 # ───────────────────────────────────────────────────────────────────────────────
 
 def build_nn_core(input_dim_params: int, seq_len: int) -> Model:

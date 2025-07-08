@@ -1,3 +1,4 @@
+# For colab:
 !pip install pytorch_lightning optuna optuna_integration[pytorch_lightning]
 !pip install --upgrade optuna
 #!/usr/bin/env python3
@@ -68,9 +69,6 @@ import torch.nn.utils as nn_utils
 #   CONFIGURATIONS & CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ⚠️ --- ACTION REQUIRED: UPDATE FILE PATHS --- ⚠️
-# Set the paths to your input data files and desired output directory.
-# Using placeholder paths for demonstration.
 INPUT_FILE_PARAMS = "/content/drive/MyDrive/Colab Notebooks/Data_100k/LHS_parameters_m.txt"
 INPUT_FILE_IV = "/content/drive/MyDrive/Colab Notebooks/Data_100k/iV_m.txt"
 OUTPUT_DIR = Path("./lightning_output_hpo")
@@ -154,7 +152,6 @@ CONFIG = {
     }
 }
 
-# Column names for the parameters file
 COLNAMES = [
     'lH', 'lP', 'lE', 'muHh', 'muPh', 'muPe', 'muEe', 'NvH', 'NcH',
     'NvE', 'NcE', 'NvP', 'NcP', 'chiHh', 'chiHe', 'chiPh', 'chiPe',
