@@ -1,10 +1,8 @@
+# GOOGLE COLAB SINGLE SCRIPT VERSION
 # If you are running this from Colab, you need to comment out:
 # !pip install pytorch_lightning
-
 #
-# ==============================================================================
 #  Physics-Informed Attention-TCN for I-V Curve Reconstruction in PyTorch
-# ==============================================================================
 #
 # This is the latest model as of Jun. 29, 2025. - Ozdincer
 #
@@ -56,15 +54,13 @@ from pytorch_lightning.loggers import TensorBoardLogger
 #   CONFIGURATIONS & CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ⚠️ --- ACTION REQUIRED: UPDATE FILE PATHS --- ⚠️
-# Set the paths to your input data files and desired output directory.
-# Note: This script will create a './data/processed' subdirectory for precomputed files.
+# !!!! Action req. Mount Google Drive then change directory
+# Data files in Github main branch
 INPUT_FILE_PARAMS = "/content/drive/MyDrive/Colab Notebooks/Data_100k/LHS_parameters_m.txt"
 INPUT_FILE_IV = "/content/drive/MyDrive/Colab Notebooks/Data_100k/iV_m.txt"
 OUTPUT_DIR = Path("./lightning_output")
 # --------------------------------------------------------------------------
 
-# Ensure the output directories exist
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 Path("./data/processed").mkdir(parents=True, exist_ok=True)
 
@@ -149,7 +145,7 @@ log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#   UTILITY FUNCTIONS (from `utils.py`)
+#   UTILITY FUNCTIONS (orig. in 'utils.py')
 # ──────────────────────────────────────────────────────────────────────────────
 
 def seed_everything(seed: int):
@@ -162,7 +158,6 @@ def process_iv_with_pchip(
     v_max: float, n_fine: int
 ) -> typing.Optional[tuple]:
     """Identical logic to the TF version, but with improved type hints."""
-    # ✔️ CRITIQUE ADDRESSED: Using typing.Optional for Python < 3.10 compatibility
     seq_len = n_pre + 1 + n_post
     try:
         pi = PchipInterpolator(full_v_grid, iv_raw, extrapolate=False)
@@ -238,7 +233,7 @@ def get_param_transformer(colnames: list[str]) -> ColumnTransformer:
 #   MODEL COMPONENTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ‹›‹›‹› Positional Embeddings (from `models/embeddings.py`) ‹›‹›‹›
+# Positional Embeddings (from 'models/embeddings.py') . Fourier is best performing
 
 class FourierFeatures(nn.Module):
     def __init__(self, num_bands: int, v_max: float = 1.4):
@@ -249,7 +244,7 @@ class FourierFeatures(nn.Module):
         self.out_dim = num_bands * 2
 
     def forward(self, v: torch.Tensor) -> torch.Tensor:
-        # ✔️ CRITIQUE ADDRESSED: Use device-aware tensor for pi
+        # Fixed error: Use device-aware tensor for pi
         two_pi = torch.tensor(2 * math.pi, device=v.device, dtype=v.dtype)
         v_norm = v / self.v_max
         v_proj = v_norm.unsqueeze(-1) * self.B
@@ -261,7 +256,7 @@ class ClippedFourierFeatures(nn.Module):
         super().__init__()
         self.v_max = v_max
         B = torch.logspace(0, 3, num_bands)
-        # ✔️ CRITIQUE ADDRESSED: Pre-broadcast mask for efficiency
+        # Fixed getting stuck sometimes: Pre-broadcast mask for efficiency
         B_mask = (B >= 1.0).float().unsqueeze(0).unsqueeze(0)
         self.register_buffer('B', B, persistent=False)
         self.register_buffer('B_mask', B_mask, persistent=False)
@@ -302,7 +297,7 @@ def make_positional_embedding(cfg: dict) -> nn.Module:
         return GaussianRBFFeatures(cfg['model']['gaussian_bands'], cfg['model']['gaussian_sigma'], cfg['dataset']['pchip']['v_max'])
     raise ValueError(f"Unknown embedding type: {etype}")
 
-# ‹›‹›‹› Physics-Informed Loss (from `models/losses.py`) ‹›‹›‹›
+# Physics-Informed Loss (from `models/losses.py`) (mse, monotonicity, convexity, curvature)
 
 def physics_loss(
     y_pred: torch.Tensor, y_true: torch.Tensor, sample_w: torch.Tensor, loss_w: dict
@@ -327,16 +322,16 @@ def physics_loss(
         'convex': convex_loss, 'excurv': excurv_loss
     }
 
-# ‹›‹›‹› Core Model Architecture (from `models/tcn_attention.py`) ‹›‹›‹›
+# Core Model Architecture (from `models/tcn_attention.py`) (best performing, latest architecture as of Jul. 3)
 
 class ChannelLayerNorm(nn.Module):
-    # ✔️ CRITIQUE ADDRESSED: Helper module for clean LayerNorm on channel dimension
+    # Change: Helper module for clean LayerNorm on channel dimension
     def __init__(self, num_channels):
         super().__init__()
         self.norm = nn.LayerNorm(num_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is [B, C, L], LayerNorm expects [..., C]
+        # x is [B, C, L], LayerNorm expects something like [..., C]. fixed √
         return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
 class TemporalBlock(nn.Module):
@@ -383,7 +378,7 @@ class IVDataset(Dataset):
         self.split = split
         data = np.load(cfg['dataset']['paths']['preprocessed_npz'], allow_pickle=True)
         
-        # ✔️ CRITIQUE ADDRESSED: Use clean split_labels array for indexing
+        # FIXED INDEXING. Now it should be the same as the MATLAB code (MATLAB would be one index ahead)
         split_labels = data['split_labels']
         indices = np.where(split_labels == split)[0]
 
@@ -436,7 +431,7 @@ class IVDataModule(pl.LightningDataModule):
             log.info("Found preprocessed data. Skipping preprocessing.")
 
     def setup(self, stage: str | None = None):
-        # ✔️ CRITIQUE ADDRESSED: Load transformers once here, not in Dataset
+        # Load transformers here, not in dataset
         if self.param_tf is None:
             self.param_tf = joblib.load(self.cfg['dataset']['paths']['param_transformer'])
             self.scalar_tf = joblib.load(self.cfg['dataset']['paths']['scalar_transformer'])
@@ -455,7 +450,7 @@ class IVDataModule(pl.LightningDataModule):
         return DataLoader(self.test_dataset, **self.cfg['dataset']['dataloader'])
         
     def _preprocess_and_save(self):
-        # This is the main data crunching function.
+        # Pchip fixed, also got rid of hard-coding the hyperparams
         log.info("--- Starting Data Preprocessing ---")
         cfg = self.cfg
         paths = cfg['dataset']['paths']
@@ -511,7 +506,7 @@ class IVDataModule(pl.LightningDataModule):
         split_labels[val_idx] = 'val'
         split_labels[test_idx] = 'test'
 
-        # ✔️ CRITIQUE ADDRESSED: Store fine curves in dense padded arrays instead of object array
+        # Don't store fine curves in object array, they will be in dense padded arrays 
         max_len = max(len(v) for v, i in fine_curves_tuples)
         v_fine_padded = np.full((len(fine_curves_tuples), max_len), np.nan, dtype=np.float32)
         i_fine_padded = np.full((len(fine_curves_tuples), max_len), np.nan, dtype=np.float32)
@@ -529,7 +524,7 @@ class IVDataModule(pl.LightningDataModule):
         log.info(f"Saved all preprocessed data and transformers to {paths['output_dir']}")
 
 class PhysicsIVSystem(pl.LightningModule):
-    # ✔️ CRITIQUE ADDRESSED: Accept scheduler steps during init
+    # FIXED: Accept scheduler steps during init
     def __init__(self, cfg: dict, warmup_steps: int, total_steps: int):
         super().__init__()
         self.save_hyperparameters(cfg) # Saves the regular config
@@ -556,7 +551,7 @@ class PhysicsIVSystem(pl.LightningModule):
         self.apply(self._init_weights)
         
     def _init_weights(self, module):
-        # ✔️ CRITIQUE ADDRESSED: More comprehensive initialization
+        # Initialize weights based on module type
         if isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None: nn.init.zeros_(module.bias)
@@ -582,7 +577,7 @@ class PhysicsIVSystem(pl.LightningModule):
     def _step(self, batch, stage: str):
         y_pred = self(batch['X_combined'], batch['voltage'])
         loss, comps = physics_loss(y_pred, batch['current_scaled'], batch['sample_w'], self.hparams['model']['loss_weights'])
-        # ✔️ CRITIQUE ADDRESSED: Removed redundant batch_size argument
+        # Removed redundant batch_size argument
         self.log_dict({f'{stage}_{k}': v for k, v in comps.items()}, on_step=False, on_epoch=True)
         self.log(f'{stage}_loss', loss, prog_bar=(stage == 'val'), on_step=False, on_epoch=True)
         return loss
@@ -648,14 +643,6 @@ def run_experiment(cfg: dict):
     log.info("--- Starting Testing on Best Checkpoint ---")
     test_results = trainer.test(datamodule=datamodule, ckpt_path="best")
     log.info(f"Test results: {test_results[0]}")
-
-    # (Optional) Add final evaluation and plotting here
-    # Example:
-    # from matplotlib import pyplot as plt
-    # test_loader = datamodule.test_dataloader()
-    # best_model = PhysicsIVSystem.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
-    # best_model.eval()
-    # ... plotting logic ...
 
 
 if __name__ == "__main__":

@@ -173,8 +173,8 @@ Special thanks to Prof. Erik Birgersson (NUS) for his guidance, supervision and 
 
 [^11]: Zhang, X., et al. NAC-TCN: Neural Adaptive Convolution Temporal Convolutional Network. *arXiv:2312.07507* (2023).
 
----
+<!-- --- -->
 
-## License
+<!-- ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details. -->
