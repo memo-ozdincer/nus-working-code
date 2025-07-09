@@ -1,10 +1,22 @@
-# GOOGLE COLAB SINGLE SCRIPT VERSION
-# If you are running this from Colab, you need to comment out:
-# !pip install pytorch_lightning
+
+# Golden child. Nothing better. Only thing left is:
+# 200k dataset, secondary HPO, wider and deeper neural network.
+# # Google Colab Version
+# # If you are running this from Colab, you need to comment out:
+# !pip install pytorch_lightning rich
 #
 #  Physics-Informed Attention-TCN for I-V Curve Reconstruction in PyTorch
 #
-# This is the latest model as of Jun. 29, 2025. - Ozdincer
+# MODIFICATION: This script has been updated to align more closely with a
+# previous Keras implementation for better comparison.
+#   1. Swapped LayerNorm for BatchNorm1d in the parameter MLP.
+#   2. Removed weight_norm from TCN convolutional layers.
+#   3. Changed scalar feature scaling from StandardScaler to MinMaxScaler.
+#   4. Set training precision to full 32-bit float.
+#   5. Corrected the convexity loss term to be physically accurate.
+#
+# REFACTOR & PATCH: This script uses a memory-efficient architecture and
+# integrates a user-provided patch for superior plot reconstruction.
 #
 # --- ARCHITECTURE ---
 #   - Hybrid Attention-Augmented Temporal Convolutional Network (TCN).
@@ -14,29 +26,22 @@
 # --- WORKFLOW ---
 #   1. Configuration: All hyperparameters are defined in a single `CONFIG` dict.
 #   2. Preprocessing: A one-time function processes raw data, applies PCHIP
-#      interpolation, creates features, and saves a clean .npz file.
+#      interpolation, creates features, and saves training slices to a .npz file
+#      and fine-grid curves to memory-mapped files.
 #   3. Data Loading: A PyTorch Lightning `DataModule` efficiently handles
 #      loading data for train, validation, and test sets.
 #   4. Model: The `PhysicsIVSystem` LightningModule encapsulates the entire
 #      model, training logic, and optimizer configuration.
-#   5. Training: The `pl.Trainer` automates the training loop, including
-#      mixed-precision, checkpointing, logging, and early stopping.
+#   5. Training: The `pl.Trainer` automates the training loop, with a custom
+#      callback that generates high-fidelity reconstructed plots on test completion.
 #
 # ==============================================================================
-
-# GOOGLE COLAB SINGLE SCRIPT VERSION
-# If you are running this from Colab, you need to comment out:
-#    !pip install pytorch_lightning
-#
-# Physics-Informed Attention-TCN for I-V Curve Reconstruction in PyTorch
-#
-# Latest as of Jul. 9, 2025 — fixed configuration with best HPO results
-# 31 device parameters + 3 scalar features = 34 total input dimensions
-#
 import os
 import logging
 from pathlib import Path
 from datetime import datetime
+import math
+import typing
 
 import numpy as np
 import pandas as pd
@@ -47,11 +52,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 
+# Added all missing imports for a self-contained script
+from torch.utils.data import Dataset, DataLoader
+from scipy.interpolate import PchipInterpolator
+from tqdm.auto import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler, StandardScaler, FunctionTransformer, MinMaxScaler
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.callbacks import RichProgressBar
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from PIL import Image
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #   CONFIGURATIONS & CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Paths to input/output data
+# --- MAKE SURE TO UPDATE THESE PATHS IF USING YOUR OWN DRIVE ---
 INPUT_FILE_PARAMS = "/content/drive/MyDrive/Colab Notebooks/Data_100k/LHS_parameters_m.txt"
 INPUT_FILE_IV = "/content/drive/MyDrive/Colab Notebooks/Data_100k/iV_m.txt"
 OUTPUT_DIR = Path("./lightning_output")
@@ -67,19 +89,15 @@ CONFIG = {
         "run_name": f"AttentionTCN-run-{datetime.now().strftime('%Y%m%d_%H%M%S')}",
     },
     "model": {
-        # 34 = 31 device parameters + 3 scalar features
         "param_dim": 34,
         "dense_units": [256, 128, 128],
-        # HPO-optimal filters and architecture
         "filters": [128, 64],
         "kernel": 5,
         "heads": 4,
         "dropout": 0.03631232181608377,
-        # Embedding: Gaussian RBF with optimized bands and sigma
-        "embedding_type": 'fourier_clipped', 
+        "embedding_type": 'gaussian',
         "gaussian_bands": 18,
         "gaussian_sigma": 0.07749512610240868,
-        # Physics-loss weighting (unchanged)
         "loss_weights": {
             "mse": 0.98,
             "mono": 0.005,
@@ -99,13 +117,15 @@ CONFIG = {
             "params_csv": INPUT_FILE_PARAMS,
             "iv_raw_txt": INPUT_FILE_IV,
             "output_dir": "./data/processed",
-            "preprocessed_npz": "./data/processed/precomputed_data.npz",
+            "preprocessed_npz": "./data/processed/preprocessed_data.npz",
             "param_transformer": "./data/processed/param_transformer.joblib",
             "scalar_transformer": "./data/processed/scalar_transformer.joblib",
+            "v_fine_memmap": "./data/processed/v_fine_curves.mmap",
+            "i_fine_memmap": "./data/processed/i_fine_curves.mmap",
         },
         "pchip": {
             "v_max": 1.4,
-            "n_fine": 10000,
+            "n_fine": 2000,
             "n_pre_mpp": 3,
             "n_post_mpp": 4,
             "seq_len": 8,
@@ -121,10 +141,10 @@ CONFIG = {
         },
     },
     "trainer": {
-        "max_epochs": 100,
+        "max_epochs": 12,
         "accelerator": "auto",
         "devices": "auto",
-        "precision": "16-mixed",
+        "precision": "32-true",
         "gradient_clip_val": 1.0,
         "log_every_n_steps": 25,
     },
@@ -132,11 +152,8 @@ CONFIG = {
 
 # Column names for the 31 device parameters
 COLNAMES = [
-    'lH','lP','lE',
-    'muHh','muPh','muPe','muEe','NvH','NcH','NvE','NcE','NvP','NcP',
-    'chiHh','chiHe','chiPh','chiPe','chiEh','chiEe',
-    'Wlm','Whm',
-    'epsH','epsP','epsE',
+    'lH','lP','lE', 'muHh','muPh','muPe','muEe','NvH','NcH','NvE','NcE','NvP','NcP',
+    'chiHh','chiHe','chiPh','chiPe','chiEh','chiEe', 'Wlm','Whm', 'epsH','epsP','epsE',
     'Gavg','Aug','Brad','Taue','Tauh','vII','vIII'
 ]
 
@@ -144,24 +161,18 @@ COLNAMES = [
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-#   UTILITY FUNCTIONS (orig. in 'utils.py')
+#   UTILITY FUNCTIONS
 # ──────────────────────────────────────────────────────────────────────────────
 
 def seed_everything(seed: int):
-    """Set random seeds for reproducibility."""
     pl.seed_everything(seed, workers=True)
 
-
-def process_iv_with_pchip(
-    iv_raw: np.ndarray, full_v_grid: np.ndarray, n_pre: int, n_post: int,
-    v_max: float, n_fine: int
-) -> typing.Optional[tuple]:
-    """Identical logic to the TF version, but with improved type hints."""
+def process_iv_with_pchip(iv_raw, full_v_grid, n_pre, n_post, v_max, n_fine) -> typing.Optional[tuple]:
+    """Finds key points (Isc, Voc, MPP) and extracts a fixed-length slice."""
     seq_len = n_pre + 1 + n_post
     try:
+        if np.count_nonzero(~np.isnan(iv_raw)) < 4: return None
         pi = PchipInterpolator(full_v_grid, iv_raw, extrapolate=False)
         v_fine = np.linspace(0, v_max, n_fine)
         i_fine = pi(v_fine)
@@ -179,46 +190,29 @@ def process_iv_with_pchip(
         v_pre_mpp = np.linspace(v_search[0], v_mpp, n_pre + 2, endpoint=True)[:-1]
         v_post_mpp = np.linspace(v_mpp, v_search[-1], n_post + 2, endpoint=True)[1:]
         v_mpp_grid = np.unique(np.concatenate([v_pre_mpp, v_post_mpp]))
-        v_slice = np.interp(
-            np.linspace(0, 1, seq_len), np.linspace(0, 1, len(v_mpp_grid)), v_mpp_grid)
+        v_slice = np.interp(np.linspace(0, 1, seq_len), np.linspace(0, 1, len(v_mpp_grid)), v_mpp_grid)
         i_slice = pi(v_slice)
         if np.any(np.isnan(i_slice)) or i_slice.shape[0] != seq_len: return None
-        return (
-            v_slice.astype(np.float32),
-            i_slice.astype(np.float32),
-            (v_fine.astype(np.float32), i_fine.astype(np.float32))
-        )
+        return (v_slice.astype(np.float32), i_slice.astype(np.float32), (v_fine.astype(np.float16), i_fine.astype(np.float16)))
     except (ValueError, IndexError): return None
 
-
 def normalize_and_scale_by_isc(curve: np.ndarray) -> tuple[float, np.ndarray]:
-    """Scales curve to [-1, 1] and returns the Isc value."""
     isc_val = float(curve[0])
     return isc_val, (2.0 * (curve / isc_val) - 1.0).astype(np.float32)
 
-
 def compute_curvature_weights(y_curves: np.ndarray, alpha: float, power: float) -> np.ndarray:
-    """Computes sample weights based on curvature of the scaled curves."""
     padded = np.pad(y_curves, ((0, 0), (1, 1)), mode='edge')
     kappa = np.abs(padded[:, 2:] - 2 * padded[:, 1:-1] + padded[:, :-2])
     max_kappa = np.max(kappa, axis=1, keepdims=True)
     max_kappa[max_kappa < 1e-9] = 1.0
     return (1.0 + alpha * np.power(kappa / max_kappa, power)).astype(np.float32)
 
-
 def get_param_transformer(colnames: list[str]) -> ColumnTransformer:
-    """Builds the sklearn ColumnTransformer for input parameters."""
     param_defs = {
         'layer_thickness': ['lH', 'lP', 'lE'],
-        'material_properties': [
-            'muHh', 'muPh', 'muPe', 'muEe', 'NvH', 'NcH', 'NvE', 'NcE',
-            'NvP', 'NcP', 'chiHh', 'chiHe', 'chiPh', 'chiPe', 'chiEh',
-            'chiEe', 'epsH', 'epsP', 'epsE'
-        ],
+        'material_properties': ['muHh', 'muPh', 'muPe', 'muEe', 'NvH', 'NcH', 'NvE', 'NcE', 'NvP', 'NcP', 'chiHh', 'chiHe', 'chiPh', 'chiPe', 'chiEh', 'chiEe', 'epsH', 'epsP', 'epsE'],
         'contacts': ['Wlm', 'Whm'],
-        'recombination_gen': [
-            'Gavg', 'Aug', 'Brad', 'Taue', 'Tauh', 'vII', 'vIII'
-        ]
+        'recombination_gen': ['Gavg', 'Aug', 'Brad', 'Taue', 'Tauh', 'vII', 'vIII']
     }
     transformers = []
     for group, cols in param_defs.items():
@@ -230,12 +224,17 @@ def get_param_transformer(colnames: list[str]) -> ColumnTransformer:
         transformers.append((group, Pipeline(steps), actual_cols))
     return ColumnTransformer(transformers, remainder='passthrough')
 
+def denormalize(scaled_current, isc):
+    is_tensor = isinstance(scaled_current, torch.Tensor)
+    if is_tensor:
+        isc = isc.unsqueeze(1)
+    else:
+        isc = isc[:, np.newaxis]
+    return (scaled_current + 1.0) / 2.0 * isc
 
 # ──────────────────────────────────────────────────────────────────────────────
 #   MODEL COMPONENTS
 # ──────────────────────────────────────────────────────────────────────────────
-
-# Positional Embeddings (from 'models/embeddings.py') . Fourier is best performing
 
 class FourierFeatures(nn.Module):
     def __init__(self, num_bands: int, v_max: float = 1.4):
@@ -244,26 +243,21 @@ class FourierFeatures(nn.Module):
         B = torch.logspace(0, 3, num_bands)
         self.register_buffer('B', B, persistent=False)
         self.out_dim = num_bands * 2
-
     def forward(self, v: torch.Tensor) -> torch.Tensor:
-        # Fixed error: Use device-aware tensor for pi
         two_pi = torch.tensor(2 * math.pi, device=v.device, dtype=v.dtype)
         v_norm = v / self.v_max
         v_proj = v_norm.unsqueeze(-1) * self.B
         return torch.cat([(two_pi * v_proj).sin(), (two_pi * v_proj).cos()], dim=-1)
-
 
 class ClippedFourierFeatures(nn.Module):
     def __init__(self, num_bands: int, v_max: float = 1.4):
         super().__init__()
         self.v_max = v_max
         B = torch.logspace(0, 3, num_bands)
-        # Fixed getting stuck sometimes: Pre-broadcast mask for efficiency
         B_mask = (B >= 1.0).float().unsqueeze(0).unsqueeze(0)
         self.register_buffer('B', B, persistent=False)
         self.register_buffer('B_mask', B_mask, persistent=False)
         self.out_dim = num_bands * 2
-
     def forward(self, v: torch.Tensor) -> torch.Tensor:
         two_pi = torch.tensor(2 * math.pi, device=v.device, dtype=v.dtype)
         v_norm = v / self.v_max
@@ -271,7 +265,6 @@ class ClippedFourierFeatures(nn.Module):
         sines = (two_pi * v_proj).sin() * self.B_mask
         coses = (two_pi * v_proj).cos() * self.B_mask
         return torch.cat([sines, coses], dim=-1)
-
 
 class GaussianRBFFeatures(nn.Module):
     def __init__(self, num_bands: int, sigma: float = 0.1, v_max: float = 1.4):
@@ -281,15 +274,12 @@ class GaussianRBFFeatures(nn.Module):
         mu = torch.linspace(0, 1, num_bands)
         self.register_buffer('mu', mu, persistent=False)
         self.out_dim = num_bands
-
     def forward(self, v: torch.Tensor) -> torch.Tensor:
         v_norm = v / self.v_max
         diff = v_norm.unsqueeze(-1) - self.mu
         return torch.exp(-0.5 * (diff / self.sigma)**2)
 
-
 def make_positional_embedding(cfg: dict) -> nn.Module:
-    """Factory function for embeddings."""
     etype = cfg['model']['embedding_type']
     if etype == 'fourier':
         return FourierFeatures(cfg['model']['fourier_bands'], cfg['dataset']['pchip']['v_max'])
@@ -299,52 +289,34 @@ def make_positional_embedding(cfg: dict) -> nn.Module:
         return GaussianRBFFeatures(cfg['model']['gaussian_bands'], cfg['model']['gaussian_sigma'], cfg['dataset']['pchip']['v_max'])
     raise ValueError(f"Unknown embedding type: {etype}")
 
-# Physics-Informed Loss (from `models/losses.py`) (mse, monotonicity, convexity, curvature)
-
-def physics_loss(
-    y_pred: torch.Tensor, y_true: torch.Tensor, sample_w: torch.Tensor, loss_w: dict
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Calculates the total physics-informed loss."""
+def physics_loss(y_pred: torch.Tensor, y_true: torch.Tensor, sample_w: torch.Tensor, loss_w: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     mse_loss = (((y_true - y_pred)**2) * sample_w).mean()
     mono_violations = torch.relu(y_pred[:, 1:] - y_pred[:, :-1])
     mono_loss = mono_violations.pow(2).mean()
-    convex_violations = torch.relu(y_pred[:, :-2] - 2 * y_pred[:, 1:-1] + y_pred[:, 2:])
+    convex_violations = torch.relu(2 * y_pred[:, 1:-1] - y_pred[:, :-2] - y_pred[:, 2:])
     convex_loss = convex_violations.pow(2).mean()
     curvature = torch.abs(y_pred[:, :-2] - 2 * y_pred[:, 1:-1] + y_pred[:, 2:])
     excurv_violations = torch.relu(curvature - loss_w['excess_threshold'])
     excurv_loss = excurv_violations.pow(2).mean()
-    total_loss = (
-        loss_w['mse'] * mse_loss +
-        loss_w['mono'] * mono_loss +
-        loss_w['convex'] * convex_loss +
-        loss_w['excurv'] * excurv_loss
-    )
-    return total_loss, {
-        'mse': mse_loss, 'mono': mono_loss,
-        'convex': convex_loss, 'excurv': excurv_loss
-    }
-
-# Core Model Architecture (from `models/tcn_attention.py`) (best performing, latest architecture as of Jul. 3)
+    total_loss = (loss_w['mse'] * mse_loss + loss_w['mono'] * mono_loss + loss_w['convex'] * convex_loss + loss_w['excurv'] * excurv_loss)
+    return total_loss, {'mse': mse_loss, 'mono': mono_loss, 'convex': convex_loss, 'excurv': excurv_loss}
 
 class ChannelLayerNorm(nn.Module):
-    # Change: Helper module for clean LayerNorm on channel dimension
     def __init__(self, num_channels):
         super().__init__()
         self.norm = nn.LayerNorm(num_channels)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is [B, C, L], LayerNorm expects something like [..., C]. fixed √
         return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
 class TemporalBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dropout: float):
         super().__init__()
         self.padding = (kernel_size - 1, 0)
-        self.conv1 = weight_norm(nn.Conv1d(in_ch, out_ch, kernel_size))
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size)
         self.act1 = nn.GELU()
         self.norm1 = ChannelLayerNorm(out_ch)
         self.drop1 = nn.Dropout(dropout)
-        self.conv2 = weight_norm(nn.Conv1d(out_ch, out_ch, kernel_size))
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size)
         self.act2 = nn.GELU()
         self.norm2 = ChannelLayerNorm(out_ch)
         self.drop2 = nn.Dropout(dropout)
@@ -364,11 +336,9 @@ class SelfAttentionBlock(nn.Module):
         self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
         self.norm = nn.LayerNorm(dim)
         self.drop = nn.Dropout(dropout)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         attn_out, _ = self.attn(x, x, x)
         return self.norm(x + self.drop(attn_out))
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 #   PYTORCH LIGHTNING DATA & MODEL MODULES
@@ -379,42 +349,23 @@ class IVDataset(Dataset):
         self.cfg = cfg
         self.split = split
         data = np.load(cfg['dataset']['paths']['preprocessed_npz'], allow_pickle=True)
-        
-        # FIXED INDEXING. Now it should be the same as the MATLAB code (MATLAB would be one index ahead)
         split_labels = data['split_labels']
         indices = np.where(split_labels == split)[0]
-
         self.v_slices = torch.from_numpy(data['v_slices'][indices])
         self.i_slices_scaled = torch.from_numpy(data['i_slices_scaled'][indices])
         self.sample_weights = torch.from_numpy(data['sample_weights'][indices])
-
         params_df = pd.read_csv(cfg['dataset']['paths']['params_csv'], header=None, names=COLNAMES)
         params_df_valid = params_df.iloc[data['valid_indices']].reset_index(drop=True)
-        scalar_df = pd.DataFrame({
-            'I_ref': data['i_slices'][:, 0],
-            'V_mpp': data['v_slices'][:, 3],
-            'I_mpp': data['i_slices'][:, 3]
-        })
-
+        scalar_df = pd.DataFrame({'I_ref': data['i_slices'][:, 0], 'V_mpp': data['v_slices'][:, 3], 'I_mpp': data['i_slices'][:, 3]})
         X_params_full = param_tf.transform(params_df_valid).astype(np.float32)
         X_scalar_full = scalar_tf.transform(scalar_df).astype(np.float32)
         X_combined = np.concatenate([X_params_full, X_scalar_full], axis=1)
         self.X = torch.from_numpy(X_combined[indices])
-        
-        # Physical values for evaluation
         self.isc_vals = torch.from_numpy(data['isc_vals'][indices])
-
     def __len__(self):
         return len(self.v_slices)
-
     def __getitem__(self, idx):
-        return {
-          'X_combined': self.X[idx],
-          'voltage': self.v_slices[idx],
-          'current_scaled': self.i_slices_scaled[idx],
-          'sample_w': self.sample_weights[idx],
-          'isc': self.isc_vals[idx],
-        }
+        return {'X_combined': self.X[idx], 'voltage': self.v_slices[idx], 'current_scaled': self.i_slices_scaled[idx], 'sample_w': self.sample_weights[idx], 'isc': self.isc_vals[idx]}
 
 class IVDataModule(pl.LightningDataModule):
     def __init__(self, cfg: dict):
@@ -422,236 +373,327 @@ class IVDataModule(pl.LightningDataModule):
         self.cfg = cfg
         self.param_tf = None
         self.scalar_tf = None
-
     def prepare_data(self):
-        # This method is called once per node. Good for downloads, etc.
-        # Here we use it for our one-time preprocessing.
         if not Path(self.cfg['dataset']['paths']['preprocessed_npz']).exists():
             log.info("Preprocessed data not found. Running preprocessing...")
             self._preprocess_and_save()
         else:
             log.info("Found preprocessed data. Skipping preprocessing.")
-
     def setup(self, stage: str | None = None):
-        # Load transformers here, not in dataset
         if self.param_tf is None:
             self.param_tf = joblib.load(self.cfg['dataset']['paths']['param_transformer'])
             self.scalar_tf = joblib.load(self.cfg['dataset']['paths']['scalar_transformer'])
-
         if stage == "fit" or stage is None:
             self.train_dataset = IVDataset(self.cfg, 'train', self.param_tf, self.scalar_tf)
             self.val_dataset = IVDataset(self.cfg, 'val', self.param_tf, self.scalar_tf)
         if stage == "test" or stage is None:
             self.test_dataset = IVDataset(self.cfg, 'test', self.param_tf, self.scalar_tf)
-
     def train_dataloader(self):
         return DataLoader(self.train_dataset, **self.cfg['dataset']['dataloader'], shuffle=True)
     def val_dataloader(self):
         return DataLoader(self.val_dataset, **self.cfg['dataset']['dataloader'])
     def test_dataloader(self):
         return DataLoader(self.test_dataset, **self.cfg['dataset']['dataloader'])
-        
+
     def _preprocess_and_save(self):
-        # Pchip fixed, also got rid of hard-coding the hyperparams
-        log.info("--- Starting Data Preprocessing ---")
+        log.info("--- Starting Memory-Efficient Data Preprocessing ---")
         cfg = self.cfg
         paths = cfg['dataset']['paths']
+        pchip_cfg = cfg['dataset']['pchip']
+
         params_df = pd.read_csv(paths['params_csv'], header=None, names=COLNAMES)
         iv_data_raw = np.loadtxt(paths['iv_raw_txt'], delimiter=',')
         full_v_grid = np.concatenate([np.arange(0, 0.4 + 1e-8, 0.1), np.arange(0.425, 1.4 + 1e-8, 0.025)]).astype(np.float32)
-        
-        pchip_cfg = cfg['dataset']['pchip']
+
+        N_raw = len(iv_data_raw)
+        log.info(f"Opening memory-mapped files for {N_raw} curves...")
+        v_fine_mm = np.memmap(paths['v_fine_memmap'], dtype=np.float16, mode='w+', shape=(N_raw, pchip_cfg['n_fine']))
+        i_fine_mm = np.memmap(paths['i_fine_memmap'], dtype=np.float16, mode='w+', shape=(N_raw, pchip_cfg['n_fine']))
+        v_fine_mm[:] = np.nan
+        i_fine_mm[:] = np.nan
+
+        valid_indices, v_slices, i_slices = [], [], []
         pchip_args = (full_v_grid, pchip_cfg['n_pre_mpp'], pchip_cfg['n_post_mpp'], pchip_cfg['v_max'], pchip_cfg['n_fine'])
-        results = [process_iv_with_pchip(iv_data_raw[i], *pchip_args) for i in tqdm(range(len(iv_data_raw)), desc="PCHIP")]
-        
-        valid_indices, v_slices, i_slices, fine_curves_tuples = [], [], [], []
-        for i, res in enumerate(results):
-            if res is not None and res[1][0] > 1e-9: # ✔️ CRITIQUE ADDRESSED: Filter out zero/negative Isc curves
+
+        for i in tqdm(range(N_raw), desc="PCHIP & Streaming to Disk"):
+            res = process_iv_with_pchip(iv_data_raw[i], *pchip_args)
+            if res is not None and res[1][0] > 1e-9:
                 valid_indices.append(i)
                 v_slices.append(res[0])
                 i_slices.append(res[1])
-                fine_curves_tuples.append(res[2])
+                v_fine, i_fine = res[2]
+                v_fine_mm[i, :len(v_fine)] = v_fine
+                i_fine_mm[i, :len(i_fine)] = i_fine
 
-        log.info(f"Retained {len(valid_indices)} / {len(iv_data_raw)} valid curves after PCHIP & Isc filtering.")
-        v_slices = np.array(v_slices)
-        i_slices = np.array(i_slices)
-        valid_indices = np.array(valid_indices)
+        v_fine_mm.flush(); i_fine_mm.flush()
+        del v_fine_mm, i_fine_mm
 
-        # Normalize and compute weights
+        log.info(f"Retained {len(valid_indices)} / {N_raw} valid curves after PCHIP & Isc filtering.")
+        v_slices, i_slices, valid_indices = np.array(v_slices), np.array(i_slices), np.array(valid_indices)
+
         isc_vals, i_slices_scaled = zip(*[normalize_and_scale_by_isc(c) for c in i_slices])
-        isc_vals = np.array(isc_vals)
-        i_slices_scaled = np.array(i_slices_scaled)
+        isc_vals, i_slices_scaled = np.array(isc_vals), np.array(i_slices_scaled)
         sample_weights = compute_curvature_weights(i_slices_scaled, **cfg['dataset']['curvature_weighting'])
 
-        # Feature Engineering & Scaling
         params_df_valid = params_df.iloc[valid_indices].reset_index(drop=True)
         param_transformer = get_param_transformer(COLNAMES)
         param_transformer.fit(params_df_valid)
         joblib.dump(param_transformer, paths['param_transformer'])
+
         scalar_df = pd.DataFrame({'I_ref': i_slices[:, 0], 'V_mpp': v_slices[:, pchip_cfg['n_pre_mpp']], 'I_mpp': i_slices[:, pchip_cfg['n_pre_mpp']]})
-        scalar_transformer = Pipeline([('scaler', StandardScaler())])
+        scalar_transformer = Pipeline([('scaler', MinMaxScaler(feature_range=(-1, 1)))])
         scalar_transformer.fit(scalar_df)
         joblib.dump(scalar_transformer, paths['scalar_transformer'])
 
-        # Calculate and store the parameter dimensions
-        param_dim = param_transformer.transform(params_df_valid).shape[1]
-        scalar_dim = scalar_transformer.transform(scalar_df).shape[1]
+        param_dim, scalar_dim = param_transformer.transform(params_df_valid).shape[1], scalar_transformer.transform(scalar_df).shape[1]
         self.cfg['model']['param_dim'] = param_dim + scalar_dim
         log.info(f"Total parameter dimension calculated: {self.cfg['model']['param_dim']} ({param_dim} params + {scalar_dim} scalars)")
 
-        # Create data splits using a labels array
         all_indices = np.arange(len(valid_indices))
         train_val_idx, test_idx = train_test_split(all_indices, test_size=0.2, random_state=cfg['train']['seed'])
         train_idx, val_idx = train_test_split(train_val_idx, test_size=0.15, random_state=cfg['train']['seed'])
         split_labels = np.array([''] * len(all_indices), dtype=object)
-        split_labels[train_idx] = 'train'
-        split_labels[val_idx] = 'val'
-        split_labels[test_idx] = 'test'
+        split_labels[train_idx], split_labels[val_idx], split_labels[test_idx] = 'train', 'val', 'test'
 
-        # Don't store fine curves in object array, they will be in dense padded arrays 
-        max_len = max(len(v) for v, i in fine_curves_tuples)
-        v_fine_padded = np.full((len(fine_curves_tuples), max_len), np.nan, dtype=np.float32)
-        i_fine_padded = np.full((len(fine_curves_tuples), max_len), np.nan, dtype=np.float32)
-        for i, (v, c) in enumerate(fine_curves_tuples):
-            v_fine_padded[i, :len(v)] = v
-            i_fine_padded[i, :len(c)] = c
-            
-        np.savez(
-            paths['preprocessed_npz'],
-            v_slices=v_slices, i_slices=i_slices, i_slices_scaled=i_slices_scaled,
-            sample_weights=sample_weights, isc_vals=isc_vals,
-            valid_indices=valid_indices, split_labels=split_labels,
-            v_fine_padded=v_fine_padded, i_fine_padded=i_fine_padded # New padded arrays
-        )
-        log.info(f"Saved all preprocessed data and transformers to {paths['output_dir']}")
+        np.savez(paths['preprocessed_npz'],
+                 v_slices=v_slices, i_slices=i_slices, i_slices_scaled=i_slices_scaled,
+                 sample_weights=sample_weights, isc_vals=isc_vals,
+                 valid_indices=valid_indices, split_labels=split_labels)
+        log.info(f"Saved training/validation slice data to {paths['preprocessed_npz']}")
+        log.info(f"Saved fine-grid curves to memmap files: {paths['v_fine_memmap']} & {paths['i_fine_memmap']}")
+
 
 class PhysicsIVSystem(pl.LightningModule):
-    # FIXED: Accept scheduler steps during init
     def __init__(self, cfg: dict, warmup_steps: int, total_steps: int):
         super().__init__()
-        self.save_hyperparameters(cfg) # Saves the regular config
+        self.save_hyperparameters(cfg)
         self.hparams.warmup_steps = warmup_steps
         self.hparams.total_steps = total_steps
-        
         mcfg = self.hparams
         mlp_layers = []
         in_dim = mcfg['model']['param_dim']
         for units in mcfg['model']['dense_units']:
-            mlp_layers.extend([nn.Linear(in_dim, units), nn.GELU(), nn.LayerNorm(units), nn.Dropout(mcfg['model']['dropout'])])
+            mlp_layers.extend([
+                nn.Linear(in_dim, units),
+                nn.BatchNorm1d(units),
+                nn.GELU(),
+                nn.Dropout(mcfg['model']['dropout'])
+            ])
             in_dim = units
         self.param_mlp = nn.Sequential(*mlp_layers)
-        
         self.pos_embed = make_positional_embedding(mcfg)
-        
         seq_input_dim = mcfg['model']['dense_units'][-1] + self.pos_embed.out_dim
-        filters = mcfg['model']['filters']
-        kernel, dropout, heads = mcfg['model']['kernel'], mcfg['model']['dropout'], mcfg['model']['heads']
+        filters, kernel, dropout, heads = mcfg['model']['filters'], mcfg['model']['kernel'], mcfg['model']['dropout'], mcfg['model']['heads']
         self.tcn1 = TemporalBlock(seq_input_dim, filters[0], kernel, dropout)
         self.attn = SelfAttentionBlock(filters[0], heads, dropout)
         self.tcn2 = TemporalBlock(filters[0], filters[1], kernel, dropout)
         self.out_head = nn.Linear(filters[1], 1)
         self.apply(self._init_weights)
-        
+        self.test_preds, self.test_trues = [], []
+        self.all_test_preds_np, self.all_test_trues_np = None, None
+
     def _init_weights(self, module):
-        # Initialize weights based on module type
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None: nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Conv1d):
-            nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5), nonlinearity='leaky_relu') # GELU is similar to leaky relu
-            if module.bias is not None: nn.init.zeros_(module.bias)
-            
+
     def forward(self, X_combined: torch.Tensor, voltage: torch.Tensor) -> torch.Tensor:
         B, L = voltage.shape
         p = self.param_mlp(X_combined)
         v_emb = self.pos_embed(voltage)
         p_rep = p.unsqueeze(1).expand(-1, L, -1)
-        x = torch.cat([p_rep, v_emb], dim=-1)
-        x = x.transpose(1, 2)
+        x = torch.cat([p_rep, v_emb], dim=-1).transpose(1, 2)
         x = self.tcn1(x)
-        x = x.transpose(1, 2)
-        x = self.attn(x)
-        x = x.transpose(1, 2)
-        x = self.tcn2(x)
-        x = x.transpose(1, 2)
+        x = self.attn(x.transpose(1, 2)).transpose(1, 2)
+        x = self.tcn2(x).transpose(1, 2)
         return self.out_head(x).squeeze(-1)
 
     def _step(self, batch, stage: str):
         y_pred = self(batch['X_combined'], batch['voltage'])
         loss, comps = physics_loss(y_pred, batch['current_scaled'], batch['sample_w'], self.hparams['model']['loss_weights'])
-        # Removed redundant batch_size argument
-        self.log_dict({f'{stage}_{k}': v for k, v in comps.items()}, on_step=False, on_epoch=True)
-        self.log(f'{stage}_loss', loss, prog_bar=(stage == 'val'), on_step=False, on_epoch=True)
+        self.log_dict({f'{stage}_{k}': v for k, v in comps.items()}, on_step=False, on_epoch=True, batch_size=len(batch['voltage']))
+        self.log(f'{stage}_loss', loss, prog_bar=(stage == 'val'), on_step=False, on_epoch=True, batch_size=len(batch['voltage']))
         return loss
-        
+
     def training_step(self, batch, batch_idx): return self._step(batch, 'train')
     def validation_step(self, batch, batch_idx): return self._step(batch, 'val')
-    def test_step(self, batch, batch_idx): return self._step(batch, 'test')
-    
+
+    def test_step(self, batch, batch_idx):
+        pred_scaled = self(batch['X_combined'], batch['voltage'])
+        self.test_preds.append(denormalize(pred_scaled.cpu(), batch['isc'].cpu()))
+        self.test_trues.append(denormalize(batch['current_scaled'].cpu(), batch['isc'].cpu()))
+        loss, _ = physics_loss(pred_scaled, batch['current_scaled'], batch['sample_w'], self.hparams['model']['loss_weights'])
+        self.log("test_loss", loss, on_step=False, on_epoch=True, batch_size=len(batch['voltage']))
+
+    def on_test_epoch_start(self): self.test_preds.clear(); self.test_trues.clear()
+    def on_test_epoch_end(self):
+        if not self.test_preds: return
+        self.all_test_preds_np = torch.cat(self.test_preds, dim=0).numpy()
+        self.all_test_trues_np = torch.cat(self.test_trues, dim=0).numpy()
+        preds, trues = self.all_test_preds_np, self.all_test_trues_np
+        self.log("test/MAE_denorm", mean_absolute_error(trues.ravel(), preds.ravel()), prog_bar=True)
+        self.log("test/RMSE_denorm", np.sqrt(mean_squared_error(trues.ravel(), preds.ravel())), prog_bar=True)
+        self.log("test/avg_R2", np.mean([r2_score(trues[i], preds[i]) for i in range(len(trues))]), prog_bar=True)
+
     def configure_optimizers(self):
         opt_cfg = self.hparams['optimizer']
         optimizer = torch.optim.AdamW(self.parameters(), lr=opt_cfg['lr'], weight_decay=opt_cfg['weight_decay'])
-        final_lr = opt_cfg['lr'] * opt_cfg['final_lr_ratio']
-        warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-7, end_factor=1.0, total_iters=self.hparams.warmup_steps)
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.hparams.total_steps - self.hparams.warmup_steps, eta_min=final_lr)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[self.hparams.warmup_steps])
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=opt_cfg['lr'], total_steps=self.hparams.total_steps, pct_start=self.hparams.warmup_steps/self.hparams.total_steps, final_div_factor=1/opt_cfg['final_lr_ratio'])
         return [optimizer], [{'scheduler': scheduler, 'interval': 'step'}]
 
+# ──────────────────────────────────────────────────────────────────────────────
+#   PLOTTING CALLBACK WITH RECONSTRUCTION (PATCH APPLIED)
+# ──────────────────────────────────────────────────────────────────────────────
+class ExamplePlotsCallback(pl.Callback):
+    """
+    A callback that generates and logs illustrative plots with full curve
+    reconstruction at the end of the test phase.
+    """
+    def __init__(self, num_samples: int = 8):
+        super().__init__()
+        self.num_samples = num_samples
+
+    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        log.info("--- Generating fully reconstructed plots at the end of testing ---")
+        if pl_module.all_test_preds_np is None:
+            log.warning("Prediction arrays not found in the model. Skipping plotting.")
+            return
+
+        preds, trues = pl_module.all_test_preds_np, pl_module.all_test_trues_np
+        metrics_df = pd.DataFrame({'r2': [r2_score(trues[i], preds[i]) for i in range(len(trues))]})
+        n_samples = min(self.num_samples, len(trues))
+        plot_groups = {
+            "Random_Samples": np.random.choice(metrics_df.index, n_samples, replace=False),
+            "Best_R2_Samples": metrics_df.nlargest(n_samples, 'r2').index.values,
+            "Worst_R2_Samples": metrics_df.nsmallest(n_samples, 'r2').index.values,
+        }
+        for name, indices in plot_groups.items():
+            filename = Path(trainer.logger.log_dir) / f"test_plots_{name.lower()}.png"
+            self._generate_and_log_plot(trainer, pl_module, filename, name, indices, preds, trues, metrics_df)
+
+    def _generate_and_log_plot(self, trainer, pl_module, filename, title, indices, preds, trues, metrics_df):
+        hparams = pl_module.hparams
+        paths = hparams['dataset']['paths']
+        preprocessed_data = np.load(paths['preprocessed_npz'], allow_pickle=True)
+        test_indices_in_valid_set = np.where(preprocessed_data['split_labels'] == 'test')[0]
+
+        # load the full ground-truth fine grid (shape: [N_raw, n_fine])
+        v_fine_mm = np.memmap(paths['v_fine_memmap'], dtype=np.float16, mode='r')\
+                         .reshape(-1, hparams['dataset']['pchip']['n_fine'])
+        i_fine_mm = np.memmap(paths['i_fine_memmap'], dtype=np.float16, mode='r')\
+                         .reshape(-1, hparams['dataset']['pchip']['n_fine'])
+
+        n_samples = len(indices)
+        nrows, ncols = (n_samples + 3) // 4, 4
+        fig, axes = plt.subplots(nrows, ncols, figsize=(20, 5 * nrows),
+                                 squeeze=False, constrained_layout=True)
+        axes = axes.flatten()
+        fig.suptitle(title.replace("_", " "), fontsize=20, weight='bold')
+
+        for i, test_set_idx in enumerate(indices):
+            ax = axes[i]
+            valid_set_idx = test_indices_in_valid_set[test_set_idx]
+            raw_data_idx = preprocessed_data['valid_indices'][valid_set_idx]
+
+            v_slice = preprocessed_data['v_slices'][valid_set_idx]
+            i_true_slice = trues[test_set_idx]
+            i_pred_slice = preds[test_set_idx]
+
+            # full ground truth
+            v_fine = v_fine_mm[raw_data_idx].astype(np.float32)
+            i_fine = i_fine_mm[raw_data_idx].astype(np.float32)
+            mask = ~np.isnan(v_fine)
+            v_fine, i_fine = v_fine[mask], i_fine[mask]
+
+            # — Ground-truth full curve
+            ax.plot(v_fine, i_fine, 'k-', alpha=0.7, lw=2,
+                    label='Actual (Fine Grid)')
+
+            # — Predicted full curve, PCHIP-interpolated over the exact same fine grid
+            pred_interp = PchipInterpolator(v_slice, i_pred_slice, extrapolate=False)
+            # run it over the full fine grid so endpoints (Isc @ v=0 and Voc @ v=Voc) are honored
+            i_pred_full = pred_interp(v_fine)
+            ax.plot(v_fine, i_pred_full, 'r--', lw=2,
+                    label='Predicted (Reconstructed)')
+
+            # Points for clarity
+            ax.plot(v_slice, i_true_slice,  'bo', ms=6, label='Actual Points')
+            ax.plot(v_slice, i_pred_slice,  'rx', ms=6, mew=2, label='Predicted Points')
+
+            r2_val = metrics_df.loc[test_set_idx, 'r2']
+            ax.set_title(f"Test Sample #{test_set_idx} (R² = {r2_val:.4f})")
+            ax.set_xlabel("Voltage (V)"); ax.set_ylabel("Current (mA/cm²)")
+            ax.grid(True, linestyle='--', alpha=0.6); ax.legend()
+            if len(v_fine) > 0:
+                ax.set_xlim(left=-0.05, right=max(v_fine.max() * 1.05, 0.1))
+                ax.set_ylim(bottom=-max(i_fine.max()*0.05, 1))
+
+        for j in range(n_samples, len(axes)): fig.delaxes(axes[j])
+        plt.savefig(filename, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+        img = np.array(Image.open(filename))
+        trainer.logger.experiment.add_image(title, img, 0, dataformats='HWC')
+        log.info(f"Saved and logged reconstructed plot: {filename}")
+        del v_fine_mm, i_fine_mm
 
 # ──────────────────────────────────────────────────────────────────────────────
 #   MAIN EXECUTION SCRIPT
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_experiment(cfg: dict):
-    """Main function to run the training and testing pipeline."""
     log.info(f"Starting run '{cfg['train']['run_name']}'")
     seed_everything(cfg['train']['seed'])
 
-    # 1. Setup DataModule (will trigger preprocessing if needed)
     datamodule = IVDataModule(cfg)
     datamodule.prepare_data()
-    datamodule.setup(stage='fit') # Manually call setup to get dataloader info
+    datamodule.setup(stage='fit')
 
-    # 2. Calculate scheduler steps and instantiate model
     batches_per_epoch = len(datamodule.train_dataloader())
-    warmup_steps = cfg['optimizer']['warmup_epochs'] * batches_per_epoch
     total_steps = cfg['trainer']['max_epochs'] * batches_per_epoch
-
-    # Sanity check for parameter dimensions
-    xb, = next(iter(datamodule.train_dataloader()))['X_combined'],
-    log.info(f">>> X_combined.shape: {xb.shape}")  # should be [batch_size, param_dim]
-    log.info(f">>> CONFIG param_dim: {cfg['model']['param_dim']}")
-
-    model = PhysicsIVSystem(cfg, warmup_steps, total_steps)
+    model = PhysicsIVSystem(cfg, warmup_steps=cfg['optimizer']['warmup_epochs'] * batches_per_epoch, total_steps=total_steps)
     log.info(f"Model instantiated with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters.")
 
-    # 3. Setup Callbacks and Logger
     checkpoint_cb = ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=1, filename="best-model-{epoch:02d}")
     lr_monitor = LearningRateMonitor(logging_interval="step")
     early_stopping_cb = EarlyStopping(monitor="val_loss", patience=20, mode="min")
     logger = TensorBoardLogger(str(OUTPUT_DIR / "tb_logs"), name=cfg['train']['run_name'])
-    
-    # 4. Initialize and run Trainer
+    plot_callback = ExamplePlotsCallback(num_samples=8)
+
     trainer = pl.Trainer(
         **cfg['trainer'],
         default_root_dir=OUTPUT_DIR,
         logger=logger,
-        callbacks=[checkpoint_cb, lr_monitor, early_stopping_cb],
+        callbacks=[checkpoint_cb, lr_monitor, early_stopping_cb, RichProgressBar(), plot_callback],
     )
-    
+
     log.info("--- Starting Training ---")
     trainer.fit(model, datamodule=datamodule)
-    
-    log.info("--- Starting Testing on Best Checkpoint ---")
+
+    log.info("--- Starting Final Testing on Best Checkpoint ---")
     test_results = trainer.test(datamodule=datamodule, ckpt_path="best")
-    log.info(f"Test results: {test_results[0]}")
+    log.info(f"Final test results (see TensorBoard for details): {test_results[0]}")
+    log.info(f"Experiment Finished. Full results in: {trainer.logger.log_dir}")
 
 
 if __name__ == "__main__":
-    if not (Path(INPUT_FILE_PARAMS).exists() and Path(INPUT_FILE_IV).exists()):
-        log.error("="*80)
-        log.error("Input data files not found! Please update the paths at the top of the script.")
-        log.error(f"Checked for: {INPUT_FILE_PARAMS} and {INPUT_FILE_IV}")
-        log.error("="*80)
-    else:
-        run_experiment(CONFIG)
+    # Check for Colab environment and existence of data files
+    try:
+        import google.colab
+        if not (Path(INPUT_FILE_PARAMS).exists() and Path(INPUT_FILE_IV).exists()):
+             log.error("="*80)
+             log.error("! Google Drive is not mounted or data files not found !")
+             log.error("Please mount your drive: from google.colab import drive; drive.mount('/content/drive')")
+             log.error(f"And ensure files exist at: {INPUT_FILE_PARAMS} and {INPUT_FILE_IV}")
+             log.error("="*80)
+        else:
+             run_experiment(CONFIG)
+    except ImportError:
+        # Not in Colab, run normally
+        if not (Path(INPUT_FILE_PARAMS).exists() and Path(INPUT_FILE_IV).exists()):
+            log.error("="*80)
+            log.error("Input data files not found! Please update the paths at the top of the script.")
+            log.error(f"Checked for: {INPUT_FILE_PARAMS} and {INPUT_FILE_IV}")
+            log.error("="*80)
+        else:
+            run_experiment(CONFIG)
